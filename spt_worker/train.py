@@ -119,6 +119,16 @@ def main(args):
     if is_main_process:
         print("> --- Training finished ---")
 
+        print(f"> Saving final model weights to {args.output_dir}")
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        model_to_save = model
+        if is_distributed():
+            model_to_save = model.module
+
+        save_path = os.path.join(args.output_dir, "final_model.pt")
+        torch.save(model_to_save.state_dict(), save_path)
+        print(f"> Model saved to {save_path}")
     cleanup()
 
 
@@ -136,6 +146,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=2, help="Batch size per process (GPU).")
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Initial learning rate.")
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for the DataLoader.")
+
+    parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights.")
 
     args = parser.parse_args()
     main(args)

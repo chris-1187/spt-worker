@@ -13,10 +13,11 @@ dependencies:
   - python=3.11
   - pip
   - pytorch-cuda=11.8
-  - pytorch=2.1.0
+  - pytorch=2.1.0=*cuda*
   - torchvision=0.16.0
   - torchaudio=2.1.0
   - numpy<2.0
+  - nvidia::cuda-compiler=11.8
   - pyg
   - addict
   - timm
