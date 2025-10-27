@@ -16,7 +16,7 @@ dependencies:
   - pytorch=2.1.0
   - torchvision=0.16.0
   - torchaudio=2.1.0
-  - torch_scatter
+  - pyg
   - addict
   - timm
   - ninja
@@ -27,6 +27,5 @@ dependencies:
   - tensorboard
   - pip:
     - packaging
-    - flash-attn --no-build-isolation
     - spconv-cu118
     - open3d
