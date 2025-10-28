@@ -106,9 +106,18 @@ def main(args):
             sampler.set_epoch(epoch)
 
         for i, data_dict in enumerate(dataloader):
+            if i == 0 and is_main_process:
+                print("DEBUG - data_dict keys and types:")
+                for k, v in data_dict.items():
+                    print(f"  {k}: {type(v)}")
             # Move data to the target device
-            for key in data_dict:
-                data_dict[key] = data_dict[key].to(device, non_blocking=True)
+            for key, value in data_dict.items():
+                if isinstance(value, torch.Tensor):
+                    data_dict[key] = value.to(device, non_blocking=True)
+                elif isinstance(value, list):
+                    data_dict[key] = [v.to(device, non_blocking=True) for v in value if isinstance(v, torch.Tensor)]
+                else:
+                    data_dict[key] = value
 
             output = model(data_dict)
             logits = output.feat
