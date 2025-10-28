@@ -124,12 +124,12 @@ def main(args):
             sampler.set_epoch(epoch)
 
         for i, data_dict in enumerate(dataloader):
+            data_dict['grid_size'] = 0.01
+
             # Move data to the target device
             for key, value in data_dict.items():
                 if isinstance(value, torch.Tensor):
                     data_dict[key] = value.to(device, non_blocking=True)
-                elif isinstance(value, list):
-                    data_dict[key] = [v.to(device, non_blocking=True) for v in value if isinstance(v, torch.Tensor)]
                 else:
                     data_dict[key] = value
 
