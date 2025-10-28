@@ -95,9 +95,11 @@ def main(args):
         sampler = torch.utils.data.RandomSampler(full_dataset)
 
     # PyTorch DataLoader
+    actual_batch_size = 1
+    print(f"> DataLoader using actual batch_size: {actual_batch_size} (Ignoring args.batch_size for accumulation)")
     dataloader = DataLoader(
         full_dataset,
-        batch_size=args.batch_size,
+        batch_size=actual_batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
@@ -105,7 +107,7 @@ def main(args):
     )
 
     # Point Transformer V3 model
-    model = PointTransformerV3(in_channels=4).to(device)
+    model = PointTransformerV3(in_channels=4, enable_flash=False).to(device)
 
     # TODO: Data parallelism
     if is_distributed():
@@ -115,13 +117,18 @@ def main(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     criterion = torch.nn.CrossEntropyLoss()
 
+    # GRAD ACCUM: Calculate effective batch size
+    effective_batch_size = args.batch_size * args.accumulation_steps * world_size
     if is_main_process:
+        print(f"> Effective Batch Size: {effective_batch_size} (batch_size * accumulation_steps * world_size)")
         print("> --- Training started ---")
 
     # Training loop
     for epoch in range(args.epochs):
         if is_distributed():
             sampler.set_epoch(epoch)
+
+        optimizer.zero_grad()
 
         for i, data_dict in enumerate(dataloader):
             data_dict['grid_size'] = 0.01
@@ -139,12 +146,25 @@ def main(args):
 
             loss = criterion(logits, labels)
 
-            optimizer.zero_grad()
-            loss.backward()  # DDP automatically averages gradients
-            optimizer.step()
+            if args.accumulation_steps > 1:
+                loss = loss / args.accumulation_steps
 
-            if is_main_process and i % 10 == 0:
-                print(f"> Epoch: {epoch + 1}/{args.epochs} | Step: {i}/{len(dataloader)} | Loss: {loss.item():.4f}")
+            loss.backward()
+
+            if (i + 1) % args.accumulation_steps == 0 or (i + 1) == len(dataloader):
+                # Gradient clipping (optional but recommended)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                optimizer.zero_grad()  # Reset gradients for the next accumulation cycle
+
+                # Logging (adjust frequency as needed)
+                if is_main_process and (i + 1) // args.accumulation_steps % 10 == 0:
+                    # Note: loss.item() here is the *scaled* loss for the last micro-batch.
+                    # For a more accurate effective batch loss, you might need to accumulate it manually.
+                    # Multiply by accumulation_steps to get an estimate of the unscaled loss.
+                    print(
+                        f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps}/{len(dataloader) // args.accumulation_steps} | Approx Loss: {loss.item() * args.accumulation_steps:.4f}")
 
     if is_main_process:
         print("> --- Training finished ---")
