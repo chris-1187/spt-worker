@@ -69,6 +69,7 @@ class KittiSemanticDataset(Dataset):
         if self.labels_dir:
             label_file_path = self.label_files[idx]
             labels = np.fromfile(label_file_path, dtype=np.uint32).reshape(-1)
-            data_dict["label"] = torch.from_numpy(labels)
+            semantic_labels = (labels & 0xFFFF).astype(np.int32)  # keep lower 16 bits
+            data_dict["label"] = torch.from_numpy(semantic_labels)
 
         return data_dict

@@ -1,0 +1,29 @@
+name: spt-env
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch=2.1.0
+  - pytorch-cuda=11.8
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.8
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - ninja
+  - packaging
+  - wheel
+  - setuptools
+  - pip
+  - pip:
+      - einops
+      - timm
+      - hydra-core
+      - opencv-python
+      - tensorboard
