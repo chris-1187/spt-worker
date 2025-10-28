@@ -42,6 +42,12 @@ def cleanup():
     if is_distributed():
         dist.destroy_process_group()
 
+def collate_fn(batch):
+    """Custom collate function to handle variable-size point clouds."""
+    collated = {}
+    for key in batch[0]:
+        collated[key] = [b[key] for b in batch]
+    return collated
 
 def main(args):
     """The main training function, adaptable for single or distributed runs."""
@@ -76,6 +82,7 @@ def main(args):
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
+        collate_fn=collate_fn,
         pin_memory=True if device.type == 'cuda' else False
     )
 
