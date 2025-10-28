@@ -42,11 +42,29 @@ def cleanup():
     if is_distributed():
         dist.destroy_process_group()
 
+
 def collate_fn(batch):
     """Custom collate function to handle variable-size point clouds."""
     collated = {}
-    for key in batch[0]:
-        collated[key] = [b[key] for b in batch]
+    batch_indices = []
+
+    # Iterate over each sample in the batch
+    for i, sample in enumerate(batch):
+        num_points = sample['coord'].shape[0]
+
+        batch_indices.append(torch.full((num_points,), i, dtype=torch.long))
+
+        for key, value in sample.items():
+            if key not in collated:
+                collated[key] = []
+            collated[key].append(value)
+
+    # Concatenate all tensors for each key
+    for key in collated:
+        collated[key] = torch.cat(collated[key], dim=0)
+
+    collated['batch'] = torch.cat(batch_indices, dim=0)
+
     return collated
 
 def main(args):
@@ -106,10 +124,6 @@ def main(args):
             sampler.set_epoch(epoch)
 
         for i, data_dict in enumerate(dataloader):
-            if i == 0 and is_main_process:
-                print("DEBUG - data_dict keys and types:")
-                for k, v in data_dict.items():
-                    print(f"  {k}: {type(v)}")
             # Move data to the target device
             for key, value in data_dict.items():
                 if isinstance(value, torch.Tensor):
