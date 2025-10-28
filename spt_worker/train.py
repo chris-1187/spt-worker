@@ -152,17 +152,11 @@ def main(args):
             loss.backward()
 
             if (i + 1) % args.accumulation_steps == 0 or (i + 1) == len(dataloader):
-                # Gradient clipping (optional but recommended)
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 optimizer.step()
-                optimizer.zero_grad()  # Reset gradients for the next accumulation cycle
+                optimizer.zero_grad()
 
-                # Logging (adjust frequency as needed)
                 if is_main_process and (i + 1) // args.accumulation_steps % 10 == 0:
-                    # Note: loss.item() here is the *scaled* loss for the last micro-batch.
-                    # For a more accurate effective batch loss, you might need to accumulate it manually.
-                    # Multiply by accumulation_steps to get an estimate of the unscaled loss.
                     print(
                         f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps}/{len(dataloader) // args.accumulation_steps} | Approx Loss: {loss.item() * args.accumulation_steps:.4f}")
 
@@ -193,11 +187,19 @@ if __name__ == "__main__":
 
     # Training Hyperparameters
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs.")
-    parser.add_argument('--batch_size', type=int, default=2, help="Batch size per process (GPU).")
+    parser.add_argument('--batch_size', type=int, default=2, help="Target batch size per process (GPU) achieved via accumulation.")
+    parser.add_argument('--accumulation_steps', type=int, default=4,
+                        help="Number of steps to accumulate gradients over.")
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Initial learning rate.")
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for the DataLoader.")
 
     parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights.")
 
     args = parser.parse_args()
+
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be >= 1")
+    if args.accumulation_steps < 1:
+        raise ValueError("--accumulation_steps must be >= 1")
+
     main(args)
