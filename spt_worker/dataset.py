@@ -46,7 +46,7 @@ class KittiSemanticDataset(Dataset):
     PyTorch Dataset for the KITTI point cloud data.
     """
 
-    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, max_points: int = 50000):
+    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, max_points: int = 40000):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
