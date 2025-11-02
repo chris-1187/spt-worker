@@ -9,7 +9,7 @@ class KittiSemanticDataset(Dataset):
     PyTorch Dataset for the KITTI point cloud data.
     """
 
-    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None):
+    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, max_points: int = 80000):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
@@ -19,6 +19,7 @@ class KittiSemanticDataset(Dataset):
         """
         self.root_dir = Path(root_dir)
         self.labels_dir = Path(labels_dir) if labels_dir else None
+        self.max_points = max_points
 
         self.point_files = []
         self.label_files = []
@@ -58,6 +59,21 @@ class KittiSemanticDataset(Dataset):
         point_file_path = self.point_files[idx]
         points = np.fromfile(point_file_path, dtype=np.float32).reshape(-1, 4)
 
+        labels = None
+        if self.labels_dir:
+            label_file_path = self.label_files[idx]
+            labels = np.fromfile(label_file_path, dtype=np.uint32).reshape(-1)
+            semantic_labels = (labels & 0xFFFF).astype(np.int32)
+
+        if self.max_points is not None and points.shape[0] > self.max_points:
+            # Generate random indices to select
+            indices = np.random.choice(points.shape[0], self.max_points, replace=False)
+
+            # Sample from points and labels
+            points = points[indices]
+            if labels is not None:
+                semantic_labels = semantic_labels[indices]
+
         coords = torch.from_numpy(points[:, :3])  # XYZ
         feats = torch.from_numpy(points)  # XYZ + Intensity
 
@@ -67,9 +83,6 @@ class KittiSemanticDataset(Dataset):
         }
 
         if self.labels_dir:
-            label_file_path = self.label_files[idx]
-            labels = np.fromfile(label_file_path, dtype=np.uint32).reshape(-1)
-            semantic_labels = (labels & 0xFFFF).astype(np.int32)  # keep lower 16 bits
             data_dict["label"] = torch.from_numpy(semantic_labels)
 
         return data_dict
