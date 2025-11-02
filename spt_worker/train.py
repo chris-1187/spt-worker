@@ -107,7 +107,34 @@ def main(args):
     )
 
     # Point Transformer V3 model
-    model = PointTransformerV3(in_channels=4, enable_flash=False).to(device)
+    model = PointTransformerV3(
+        in_channels=4,
+        enable_flash=False,
+
+        # Reduce Channel Dimensions
+        # Default: (32, 64, 128, 256, 512)
+        enc_channels=(32, 64, 128, 128, 256),
+        # Default: (64, 64, 128, 256)
+        dec_channels=(32, 32, 64, 128),
+
+        # Reduce Layer Depth
+        # Default: (2, 2, 2, 6, 2)
+        enc_depths=(2, 2, 2, 2, 2),
+        # Default: (2, 2, 2, 2)
+        dec_depths=(2, 2, 2, 2),
+
+        # Reduce Head Count
+        # Default: (2, 4, 8, 16, 32)
+        enc_num_head=(2, 4, 8, 8, 16),
+        # Default: (4, 4, 8, 16)
+        dec_num_head=(4, 4, 8, 8),
+
+        # Reduce Patch Size
+        # Default: (1024, 1024, 1024, 1024, 1024)
+        enc_patch_size=(256, 256, 256, 256, 256),
+        # Default: (1024, 1024, 1024, 1024)
+        dec_patch_size=(256, 256, 256, 256)
+    ).to(device)
 
     # TODO: Data parallelism
     if is_distributed():
@@ -139,6 +166,9 @@ def main(args):
                     data_dict[key] = value.to(device, non_blocking=True)
                 else:
                     data_dict[key] = value
+
+            if is_main_process:
+                print(f">>> DEBUG: Points in batch {i}: {data_dict['coord'].shape[0]}")
 
             output = model(data_dict)
             logits = output.feat
