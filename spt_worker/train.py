@@ -10,6 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 from .dataset import KittiSemanticDataset
 from .model import PointTransformerV3
 
+IGNORE_INDEX = -1
 
 def is_distributed():
     """Checks if the script is running in a distributed environment."""
@@ -136,13 +137,21 @@ def main(args):
         dec_patch_size=(256, 256, 256, 256)
     ).to(device)
 
+    num_classes = 19
+    out_channels = 32
+    seg_head = torch.nn.Linear(out_channels, num_classes).to(device)
+
     # TODO: Data parallelism
     if is_distributed():
         model = DDP(model, device_ids=[rank] if device.type == 'cuda' else None)
+        seg_head = DDP(seg_head, device_ids=[rank] if device.type == 'cuda' else None)
 
     # Training setup
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(seg_head.parameters()),
+        lr=args.learning_rate
+    )
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
     # GRAD ACCUM: Calculate effective batch size
     effective_batch_size = args.batch_size * args.accumulation_steps * world_size
@@ -171,7 +180,7 @@ def main(args):
                 print(f">>> DEBUG: Points in batch {i}: {data_dict['coord'].shape[0]}")
 
             output = model(data_dict)
-            logits = output.feat
+            logits = seg_head(output.feat)
             labels = data_dict["label"]
 
             loss = criterion(logits, labels)

@@ -3,6 +3,43 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+IGNORE_INDEX = -1
+LABEL_MAP = {
+    0: IGNORE_INDEX,  # "unlabeled"
+    1: IGNORE_INDEX,  # "outlier"
+    10: 0,  # "car"
+    11: 1,  # "bicycle"
+    13: 4,  # "bus" -> "other-vehicle"
+    15: 2,  # "motorcycle"
+    16: 4,  # "on-rails" -> "other-vehicle"
+    18: 3,  # "truck"
+    20: 4,  # "other-vehicle"
+    30: 5,  # "person"
+    31: 6,  # "bicyclist"
+    32: 7,  # "motorcyclist"
+    40: 8,  # "road"
+    44: 9,  # "parking"
+    48: 10, # "sidewalk"
+    49: 11, # "other-ground"
+    50: 12, # "building"
+    51: 13, # "fence"
+    52: IGNORE_INDEX, # "other-structure" -> "unlabeled"
+    60: 8,  # "lane-marking" -> "road"
+    70: 14, # "vegetation"
+    71: 15, # "trunk"
+    72: 16, # "terrain"
+    80: 17, # "pole"
+    81: 18, # "traffic-sign"
+    99: IGNORE_INDEX, # "other-object" -> "unlabeled"
+    252: 0,  # "moving-car" -> "car"
+    253: 6,  # "moving-bicyclist" -> "bicyclist"
+    254: 5,  # "moving-person" -> "person"
+    255: 7,  # "moving-motorcyclist" -> "motorcyclist"
+    256: 4,  # "moving-on-rails" -> "other-vehicle"
+    257: 4,  # "moving-bus" -> "other-vehicle"
+    258: 3,  # "moving-truck" -> "truck"
+    259: 4,  # "moving-other"-vehicle -> "other-vehicle"
+}
 
 class KittiSemanticDataset(Dataset):
     """
@@ -63,7 +100,10 @@ class KittiSemanticDataset(Dataset):
         if self.labels_dir:
             label_file_path = self.label_files[idx]
             labels = np.fromfile(label_file_path, dtype=np.uint32).reshape(-1)
-            semantic_labels = (labels & 0xFFFF).astype(np.int64)
+            semantic_labels_raw = (labels & 0xFFFF).astype(np.int32)
+            semantic_labels = np.full_like(semantic_labels_raw, IGNORE_INDEX, dtype=np.int64)
+            for raw_label, mapped_label in LABEL_MAP.items():
+                semantic_labels[semantic_labels_raw == raw_label] = mapped_label
 
         if self.max_points is not None and points.shape[0] > self.max_points:
             # Generate random indices to select
