@@ -63,7 +63,7 @@ class KittiSemanticDataset(Dataset):
         if self.labels_dir:
             label_file_path = self.label_files[idx]
             labels = np.fromfile(label_file_path, dtype=np.uint32).reshape(-1)
-            semantic_labels = (labels & 0xFFFF).astype(np.int32)
+            semantic_labels = (labels & 0xFFFF).astype(np.int64)
 
         if self.max_points is not None and points.shape[0] > self.max_points:
             # Generate random indices to select
