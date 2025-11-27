@@ -205,12 +205,18 @@ def main(args):
         print(f"> Saving final model weights to {args.output_dir}")
         os.makedirs(args.output_dir, exist_ok=True)
 
-        model_to_save = model
-        if is_distributed():
-            model_to_save = model.module
+        model_to_save = model.module if is_distributed() else model
+        seg_head_to_save = seg_head.module if is_distributed() else seg_head
+
+        checkpoint = {
+            'model_state_dict': model_to_save.state_dict(),
+            'seg_head_state_dict': seg_head_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch': epoch,
+        }
 
         save_path = os.path.join(args.output_dir, "final_model.pt")
-        torch.save(model_to_save.state_dict(), save_path)
+        torch.save(checkpoint, save_path)
         print(f"> Model saved to {save_path}")
     cleanup()
 
