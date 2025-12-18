@@ -1,4 +1,5 @@
 import argparse
+import os
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -7,6 +8,22 @@ from tqdm import tqdm
 from spt_worker.dataset import KittiSemanticDataset
 from spt_worker.model import PointTransformerV3
 
+
+def collate_fn(batch):
+    collated = {}
+    batch_indices = []
+    for i, sample in enumerate(batch):
+        num_points = sample['coord'].shape[0]
+        batch_indices.append(torch.full((num_points,), i, dtype=torch.long))
+        for key, value in sample.items():
+            if key not in collated:
+                collated[key] = []
+            collated[key].append(value)
+
+    for key in collated:
+        collated[key] = torch.cat(collated[key], dim=0)
+    collated['batch'] = torch.cat(batch_indices, dim=0)
+    return collated
 
 def fast_hist(pred, label, n):
     """
@@ -43,7 +60,8 @@ def main(args):
         batch_size=1,
         num_workers=args.num_workers,
         shuffle=False,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
 
     # Model Setup
@@ -74,11 +92,14 @@ def main(args):
     # Handle the dictionary format
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
-        seg_head.load_state_dict(checkpoint['seg_head_state_dict'])
+        if 'seg_head_state_dict' in checkpoint:
+            seg_head.load_state_dict(checkpoint['seg_head_state_dict'])
+        else:
+            print("! WARNING: 'seg_head_state_dict' not found. Predictions will be random.")
     else:
-        # Fallback for old checkpoints
-        print("! WARNING: Old checkpoint format detected. SegHead weights might be missing/random.")
+        # Fallback for simple model saves
         model.load_state_dict(checkpoint)
+        print("! WARNING: Loaded simple checkpoint. SegHead weights likely missing.")
 
     model.eval()
     seg_head.eval()
@@ -98,11 +119,6 @@ def main(args):
                     data_dict[key] = value
 
             # Forward Pass
-            # Handle the collate/batching manually if not using the train collate_fn
-            # But since batch_size=1, pass data directly if we add the 'batch' key
-            if 'batch' not in data_dict:
-                data_dict['batch'] = torch.zeros(data_dict['coord'].shape[0], dtype=torch.long, device=device)
-
             output = model(data_dict)
             logits = seg_head(output.feat)
 
@@ -127,8 +143,6 @@ def main(args):
     print(f"> mIoU: {miou:.2f}%")
     print("> Per-class IoU:")
 
-    # Mapping indices back to names (Optional, based on LABEL_MAP)
-    # This list must match the order 0-18 in the LABEL_MAP values
     class_names = [
         "car", "bicycle", "motorcycle", "truck", "other-vehicle", "person", "bicyclist",
         "motorcyclist", "road", "parking", "sidewalk", "other-ground", "building",
