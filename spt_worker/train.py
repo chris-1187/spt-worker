@@ -1,5 +1,7 @@
 import argparse
 import os
+import json
+from datetime import datetime
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -71,6 +73,17 @@ def collate_fn(batch):
 def main(args):
     """The main training function, adaptable for single or distributed runs."""
     device, rank, world_size = setup_distributed()
+
+    log_dir = args.output_dir  # Fallback
+    if rank == 0:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.join(args.output_dir, run_id)
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Save config for reproducibility
+        with open(os.path.join(log_dir, "config.json"), "w") as f:
+            json.dump(vars(args), f, indent=4)
+        print(f"> [Logging] Metrics will be saved to: {log_dir}")
 
     is_main_process = (rank == 0)
     if is_main_process:
@@ -166,6 +179,10 @@ def main(args):
 
         optimizer.zero_grad()
 
+        # Track epoch loss
+        epoch_loss_sum = 0.0
+        num_batches = 0
+
         for i, data_dict in enumerate(dataloader):
             data_dict['grid_size'] = 0.01
 
@@ -179,11 +196,15 @@ def main(args):
             if is_main_process:
                 print(f">>> DEBUG: Points in batch {i}: {data_dict['coord'].shape[0]}")
 
+            # Forward Pass
             output = model(data_dict)
             logits = seg_head(output.feat)
             labels = data_dict["label"]
-
             loss = criterion(logits, labels)
+
+            # Tack loss of current batch to average later
+            epoch_loss_sum += loss.item()
+            num_batches += 1
 
             if args.accumulation_steps > 1:
                 loss = loss / args.accumulation_steps
@@ -196,8 +217,26 @@ def main(args):
                 optimizer.zero_grad()
 
                 if is_main_process and (i + 1) // args.accumulation_steps % 10 == 0:
+                    current_loss = loss.item() * args.accumulation_steps
                     print(
-                        f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps}/{len(dataloader) // args.accumulation_steps} | Approx Loss: {loss.item() * args.accumulation_steps:.4f}")
+                        f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps} | Approx Loss: {current_loss:.4f}")
+
+        if rank == 0:
+            # Calculate average loss
+            avg_train_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+
+            stats = {
+                "epoch": epoch + 1,
+                "timestamp": datetime.now().isoformat(),
+                "train_loss": avg_train_loss,
+                # val_mIoU: after validation loop
+            }
+
+            # Append to JSONL file
+            with open(os.path.join(log_dir, "metrics.jsonl"), "a") as f:
+                f.write(json.dumps(stats) + "\n")
+
+            print(f"> [Logging] Epoch {epoch + 1} finished. Avg Loss: {avg_train_loss:.4f}")
 
     if is_main_process:
         print("> --- Training finished ---")
