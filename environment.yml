@@ -1,31 +1,20 @@
-# NVIDIA GPU (CUDA 11.8)
 name: spt-worker
-
 channels:
-  - pytorch
-  - nvidia
-  - pyg
   - conda-forge
   - defaults
-
 dependencies:
   - python=3.11
   - pip
-  - pytorch=2.1.0=*cuda*
-  - torchvision=0.16.0
-  - torchaudio=2.1.0
   - numpy<2.0
-  - nvidia::cuda-compiler=11.8
-  - pyg
-  - addict
-  - timm
-  - ninja
   - h5py
   - pyyaml
   - scipy
-  - plyfile
+  - ninja
   - tensorboard
   - pip:
     - packaging
-    - spconv-cu118
+    - addict
+    - timm
+    - plyfile
     - open3d
+    - tqdm
