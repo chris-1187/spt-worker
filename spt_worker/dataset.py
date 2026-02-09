@@ -2,6 +2,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import socket
 
 IGNORE_INDEX = -1
 LABEL_MAP = {
@@ -46,7 +47,7 @@ class KittiSemanticDataset(Dataset):
     PyTorch Dataset for the KITTI point cloud data.
     """
 
-    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, max_points: int = 5000):
+    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, training: bool = None, max_points: int = 45000):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
@@ -56,20 +57,32 @@ class KittiSemanticDataset(Dataset):
         """
         self.root_dir = Path(root_dir)
         self.labels_dir = Path(labels_dir) if labels_dir else None
+
+        # Static load balancing
+        hostname = socket.gethostname()
         self.max_points = max_points
+
+        # Adjust for the weaker node (Host 3)
+        if "host3" in hostname:
+            print(f"> [Optimization] Detected Straggler Node ({hostname}). Reducing max_points to 15000.")
+            self.max_points = 15000  # Cap at 15k for the 1050 Ti
+        else:
+            print(f"> [Optimization] High-Performance Node ({hostname}). Keeping max_points at {max_points}.")
+
+        self.training = training
 
         self.point_files = []
         self.label_files = []
 
         if sequences is None:
             # If no sequences are specified, load all
-            print("No sequences specified, loading all .bin files...")
+            print("> No sequences specified, loading all .bin files...")
             self.point_files = sorted(list(self.root_dir.glob("sequences/**/*.bin")))
             if self.labels_dir:
                 self.label_files = sorted(list(self.labels_dir.glob("sequences/**/*.label")))
         else:
             # Load only the specified sequences
-            print(f"Loading specified sequences: {sequences}")
+            print(f"> Loading specified sequences: {sequences}")
             for seq_id in sequences:
                 self.point_files.extend(list(self.root_dir.glob(f"sequences/{seq_id}/**/*.bin")))
                 if self.labels_dir:
@@ -105,11 +118,45 @@ class KittiSemanticDataset(Dataset):
             for raw_label, mapped_label in LABEL_MAP.items():
                 semantic_labels[semantic_labels_raw == raw_label] = mapped_label
 
+        if self.training:
+            valid_crop = False
+            attempt_count = 0
+            original_points = points.copy()
+            original_labels = semantic_labels.copy() if labels is not None else None
+
+            # Floor
+            min_valid_points = 2000
+
+            while not valid_crop and attempt_count < 15:
+                center_idx = np.random.randint(original_points.shape[0])
+                center = original_points[center_idx, :3]
+
+                # 8 x 8 meters block
+                block_size = 8.0
+
+                min_bound = center - block_size / 2
+                max_bound = center + block_size / 2
+
+                mask = np.all((original_points[:, :3] >= min_bound) & (original_points[:, :3] <= max_bound), axis=1)
+
+                if np.sum(mask) > min_valid_points:
+                    points = original_points[mask]
+                    if labels is not None:
+                        semantic_labels = original_labels[mask]
+                    valid_crop = True
+                else:
+                    attempt_count += 1
+
+            # Fallback
+            if not valid_crop:
+                points = original_points
+                if labels is not None:
+                    semantic_labels = original_labels
+
         if self.max_points is not None and points.shape[0] > self.max_points:
-            # Generate random indices to select
+            # Random indices to select
             indices = np.random.choice(points.shape[0], self.max_points, replace=False)
 
-            # Sample from points and labels
             points = points[indices]
             if labels is not None:
                 semantic_labels = semantic_labels[indices]

@@ -1,6 +1,8 @@
 import argparse
 import os
 import json
+import time
+import platform
 from datetime import datetime
 import torch
 import torch.distributed as dist
@@ -73,20 +75,63 @@ def collate_fn(batch):
 
 def main(args):
     """The main training function, adaptable for single or distributed runs."""
+    total_start_time = time.time()
+
     device, rank, world_size = setup_distributed()
     print(f"> [DEBUG] Global Rank: {rank} | Local Device: {device} | World Size: {world_size}")
 
-    log_dir = args.output_dir  # Fallback
-    if rank == 0:
-        # Save run config for reproducibility
-        with open(os.path.join(log_dir, "run_config.json"), "w") as f:
-            json.dump(vars(args), f, indent=4)
+    # ------------------------------------------------------------------
+    # MODEL CONFIG
+    # ------------------------------------------------------------------
+    model_config = {
+        "in_channels": 4,
+        "enable_flash": False,
+        "enc_channels": (32, 64, 128, 128, 256),
+        "dec_channels": (32, 32, 64, 128),
+        "enc_depths": (2, 2, 2, 2, 2),
+        "dec_depths": (2, 2, 2, 2),
+        "enc_num_head": (2, 4, 8, 8, 16),
+        "dec_num_head": (4, 4, 8, 8),
+        "enc_patch_size": (256, 256, 256, 256, 256),
+        "dec_patch_size": (256, 256, 256, 256)
+    }
 
-        print(f"> [Logging] Metrics will be saved to: {log_dir}")
-
+    # Logs
     is_main_process = (rank == 0)
+    log_dir = args.output_dir
     if is_main_process:
-        print(f"> Running in {'distributed' if is_distributed() else 'single-machine'} mode on device: {device}")
+        os.makedirs(log_dir, exist_ok=True)
+
+        effective_batch_size = args.batch_size * args.accumulation_steps * world_size
+        run_mode = "distributed" if is_distributed() else "single-node"
+
+        run_config = {
+            "meta": {
+                "timestamp": datetime.now().isoformat(),
+                "run_mode": run_mode,
+                "node_hostname": platform.node()
+            },
+            "arguments": vars(args),
+            "model_architecture": model_config,
+            "training_dynamics": {
+                "effective_batch_size": effective_batch_size,
+                "world_size": world_size,
+                "accumulation_steps": args.accumulation_steps,
+                "local_batch_size": 1 # Hardcoded
+            },
+            "environment": {
+                "pytorch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "gpu_name": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "CPU"
+            }
+        }
+
+        with open(os.path.join(log_dir, "run_config.json"), "w") as f:
+            json.dump(run_config, f, indent=4)
+
+        print(f"> [Logging] Configuration saved to: {log_dir}/run_config.json")
+        print(f"> [Logging] Metrics will be saved to: {log_dir}/metrics.jsonl")
+        print(f"> Running in '{run_mode}' mode on device: {device}")
         print(f"> Configuration: {args}")
         if args.sequences:
             print(f"> Training on specific sequences: {args.sequences}")
@@ -97,7 +142,8 @@ def main(args):
     full_dataset = KittiSemanticDataset(
         root_dir=args.data_path,
         labels_dir=args.labels_path,
-        sequences=args.sequences
+        sequences=args.sequences,
+        training=True
     )
 
     # Sampler is conditional on the environment
@@ -108,11 +154,9 @@ def main(args):
         sampler = torch.utils.data.RandomSampler(full_dataset)
 
     # PyTorch DataLoader
-    actual_batch_size = 1
-    print(f"> DataLoader using actual batch_size: {actual_batch_size} (Ignoring args.batch_size for accumulation)")
     dataloader = DataLoader(
         full_dataset,
-        batch_size=actual_batch_size,
+        batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
@@ -120,65 +164,42 @@ def main(args):
     )
 
     # Point Transformer V3 model
-    model = PointTransformerV3(
-        in_channels=4,
-        enable_flash=False,
-
-        # Reduce Channel Dimensions
-        # Default: (32, 64, 128, 256, 512)
-        enc_channels=(32, 64, 128, 128, 256),
-        # Default: (64, 64, 128, 256)
-        dec_channels=(32, 32, 64, 128),
-
-        # Reduce Layer Depth
-        # Default: (2, 2, 2, 6, 2)
-        enc_depths=(2, 2, 2, 2, 2),
-        # Default: (2, 2, 2, 2)
-        dec_depths=(2, 2, 2, 2),
-
-        # Reduce Head Count
-        # Default: (2, 4, 8, 16, 32)
-        enc_num_head=(2, 4, 8, 8, 16),
-        # Default: (4, 4, 8, 16)
-        dec_num_head=(4, 4, 8, 8),
-
-        # Reduce Patch Size
-        # Default: (1024, 1024, 1024, 1024, 1024)
-        enc_patch_size=(256, 256, 256, 256, 256),
-        # Default: (1024, 1024, 1024, 1024)
-        dec_patch_size=(256, 256, 256, 256)
-    ).to(device)
+    model = PointTransformerV3(**model_config).to(device)
 
     num_classes = 19
     out_channels = 32
     seg_head = torch.nn.Linear(out_channels, num_classes).to(device)
 
-    # TODO: Data parallelism
     if is_distributed():
         model = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None)
         seg_head = DDP(seg_head, device_ids=[device.index] if device.type == 'cuda' else None)
 
-    # Training setup
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(seg_head.parameters()),
         lr=args.learning_rate
     )
+
+    step_size = int(args.epochs * 0.3)
+    if step_size < 1: step_size = 1
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
+
     criterion = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
     # GRAD ACCUM: Calculate effective batch size
     effective_batch_size = args.batch_size * args.accumulation_steps * world_size
     if is_main_process:
         print(f"> Effective Batch Size: {effective_batch_size} (batch_size * accumulation_steps * world_size)")
+        print(f"> Scheduler enabled. LR will decay every {step_size} epochs.")
         print("> --- Training started ---")
 
     # Training loop
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
+
         if is_distributed():
             sampler.set_epoch(epoch)
 
         optimizer.zero_grad()
-
-        # Track epoch loss
         epoch_loss_sum = 0.0
         num_batches = 0
 
@@ -220,26 +241,61 @@ def main(args):
                     print(
                         f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps} | Approx Loss: {current_loss:.4f}")
 
+        scheduler.step()
+
         if rank == 0:
-            # Calculate average loss
+            epoch_duration = time.time() - epoch_start_time
             avg_train_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+            current_lr = scheduler.get_last_lr()[0]  # Log the new LR
+            print(f"> [Info] Epoch {epoch + 1} LR: {current_lr:.6f}")
 
             stats = {
                 "epoch": epoch + 1,
                 "timestamp": datetime.now().isoformat(),
+                "epoch_duration_sec": round(epoch_duration, 2),
+                "learning_rate": current_lr,
                 "train_loss": avg_train_loss,
                 # val_mIoU: after validation loop
             }
 
-            # Append to JSONL file
             with open(os.path.join(log_dir, "metrics.jsonl"), "a") as f:
                 f.write(json.dumps(stats) + "\n")
 
             print(f"> [Logging] Epoch {epoch + 1} finished. Avg Loss: {avg_train_loss:.4f}")
 
-    if is_main_process:
-        print("> --- Training finished ---")
+            if (epoch + 1) % 5 == 0:
+                print(f"> [Checkpoint] Saving intermediate model at Epoch {epoch + 1}...")
 
+                model_to_save = model.module if is_distributed() else model
+                seg_head_to_save = seg_head.module if is_distributed() else seg_head
+
+                checkpoint = {
+                    'model_state_dict': model_to_save.state_dict(),
+                    'seg_head_state_dict': seg_head_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'config': run_config
+                }
+
+                save_filename = f"model_weights_epoch_{epoch + 1}.pt"
+                save_path = os.path.join(args.output_dir, save_filename)
+                torch.save(checkpoint, save_path)
+                print(f"> [Checkpoint] Saved to {save_path}")
+
+    if is_main_process:
+        total_duration = time.time() - total_start_time
+
+        final_stats = {
+            "status": "finished",
+            "total_duration_sec": round(total_duration, 2),
+            "total_duration_min": round(total_duration / 60, 2),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(log_dir, "metrics.jsonl"), "a") as f:
+            f.write(json.dumps(final_stats) + "\n")
+
+        print(f"> --- Training finished in {total_duration/60:.2f} minutes ---")
         print(f"> Saving final model weights to {args.output_dir}")
 
         model_to_save = model.module if is_distributed() else model
@@ -250,11 +306,13 @@ def main(args):
             'seg_head_state_dict': seg_head_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'epoch': epoch,
+            'config': run_config
         }
 
         save_path = os.path.join(args.output_dir, "model_weights.pt")
         torch.save(checkpoint, save_path)
         print(f"> Model saved to {save_path}")
+
     cleanup()
 
 
@@ -269,7 +327,7 @@ if __name__ == "__main__":
 
     # Training Hyperparameters
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs.")
-    parser.add_argument('--batch_size', type=int, default=2, help="Target batch size per process (GPU) achieved via accumulation.")
+    parser.add_argument('--batch_size', type=int, default=1, help="Target batch size per process (GPU) achieved via accumulation.")
     parser.add_argument('--accumulation_steps', type=int, default=4,
                         help="Number of steps to accumulate gradients over.")
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Initial learning rate.")
