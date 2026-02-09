@@ -23,20 +23,21 @@ def setup_distributed():
     """Initializes the distributed process group."""
     if is_distributed():
         dist.init_process_group("nccl")
-        # torchrun sets the local rank env variable
+
         local_rank = int(os.environ["LOCAL_RANK"])
+
+        global_rank = dist.get_rank()
+
         torch.cuda.set_device(local_rank)
-        return torch.device(f"cuda:{local_rank}"), local_rank, dist.get_world_size()
+
+        return torch.device(f"cuda:{local_rank}"), global_rank, dist.get_world_size()
     else:
         # Single-machine setup
         if torch.cuda.is_available():
-            # Use the first available CUDA device for single-GPU training
             return torch.device("cuda:0"), 0, 1
         elif torch.backends.mps.is_available():
-            # Use MPS for Apple devices
             return torch.device("mps"), 0, 1
         else:
-            # Fallback to CPU
             return torch.device("cpu"), 0, 1
 
 
@@ -73,16 +74,14 @@ def collate_fn(batch):
 def main(args):
     """The main training function, adaptable for single or distributed runs."""
     device, rank, world_size = setup_distributed()
+    print(f"> [DEBUG] Global Rank: {rank} | Local Device: {device} | World Size: {world_size}")
 
     log_dir = args.output_dir  # Fallback
     if rank == 0:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = os.path.join(args.output_dir, run_id)
-        os.makedirs(log_dir, exist_ok=True)
-
-        # Save config for reproducibility
-        with open(os.path.join(log_dir, "config.json"), "w") as f:
+        # Save run config for reproducibility
+        with open(os.path.join(log_dir, "run_config.json"), "w") as f:
             json.dump(vars(args), f, indent=4)
+
         print(f"> [Logging] Metrics will be saved to: {log_dir}")
 
     is_main_process = (rank == 0)
@@ -156,8 +155,8 @@ def main(args):
 
     # TODO: Data parallelism
     if is_distributed():
-        model = DDP(model, device_ids=[rank] if device.type == 'cuda' else None)
-        seg_head = DDP(seg_head, device_ids=[rank] if device.type == 'cuda' else None)
+        model = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None)
+        seg_head = DDP(seg_head, device_ids=[device.index] if device.type == 'cuda' else None)
 
     # Training setup
     optimizer = torch.optim.AdamW(
@@ -242,7 +241,6 @@ def main(args):
         print("> --- Training finished ---")
 
         print(f"> Saving final model weights to {args.output_dir}")
-        os.makedirs(args.output_dir, exist_ok=True)
 
         model_to_save = model.module if is_distributed() else model
         seg_head_to_save = seg_head.module if is_distributed() else seg_head
@@ -254,7 +252,7 @@ def main(args):
             'epoch': epoch,
         }
 
-        save_path = os.path.join(args.output_dir, "final_model.pt")
+        save_path = os.path.join(args.output_dir, "model_weights.pt")
         torch.save(checkpoint, save_path)
         print(f"> Model saved to {save_path}")
     cleanup()
@@ -277,7 +275,7 @@ if __name__ == "__main__":
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Initial learning rate.")
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for the DataLoader.")
 
-    parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights.")
+    parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights, metrics, and logs.")
 
     args = parser.parse_args()
 
