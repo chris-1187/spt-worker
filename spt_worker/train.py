@@ -67,7 +67,8 @@ def collate_fn(batch):
 
     # Concatenate all tensors for each key
     for key in collated:
-        collated[key] = torch.cat(collated[key], dim=0)
+        if isinstance(collated[key][0], torch.Tensor):
+            collated[key] = torch.cat(collated[key], dim=0)
 
     collated['batch'] = torch.cat(batch_indices, dim=0)
 
@@ -132,6 +133,7 @@ def main(args):
         print(f"> [Logging] Configuration saved to: {log_dir}/run_config.json")
         print(f"> [Logging] Metrics will be saved to: {log_dir}/metrics.jsonl")
         print(f"> Running in '{run_mode}' mode on device: {device}")
+        print(f"> Sampling Strategy: {args.sampling_strategy.upper()}")
         print(f"> Configuration: {args}")
         if args.sequences:
             print(f"> Training on specific sequences: {args.sequences}")
@@ -143,7 +145,8 @@ def main(args):
         root_dir=args.data_path,
         labels_dir=args.labels_path,
         sequences=args.sequences,
-        training=True
+        training=True,
+        sampling_strategy=args.sampling_strategy
     )
 
     # Sampler is conditional on the environment
@@ -278,8 +281,11 @@ def main(args):
                     'config': run_config
                 }
 
+                # Update path to use the weights subdirectory
+                weights_dir = os.path.join(args.output_dir, "weights")
+                os.makedirs(weights_dir, exist_ok=True)  # Failsafe
                 save_filename = f"model_weights_epoch_{epoch + 1}.pt"
-                save_path = os.path.join(args.output_dir, save_filename)
+                save_path = os.path.join(weights_dir, save_filename)
                 torch.save(checkpoint, save_path)
                 print(f"> [Checkpoint] Saved to {save_path}")
 
@@ -309,7 +315,8 @@ def main(args):
             'config': run_config
         }
 
-        save_path = os.path.join(args.output_dir, "model_weights.pt")
+        weights_dir = os.path.join(args.output_dir, "weights")
+        save_path = os.path.join(weights_dir, "model_weights.pt")
         torch.save(checkpoint, save_path)
         print(f"> Model saved to {save_path}")
 
@@ -334,6 +341,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for the DataLoader.")
 
     parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights, metrics, and logs.")
+    parser.add_argument('--sampling_strategy', type=str, default='hilbert',
+                        choices=['hilbert', 'knn'],
+                        help="Strategy to sample point chunks: 'hilbert' (curve slicing) or 'knn' (k-nearest neighbors).")
 
     args = parser.parse_args()
 

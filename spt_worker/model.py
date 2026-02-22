@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 from collections import OrderedDict
 
 try:

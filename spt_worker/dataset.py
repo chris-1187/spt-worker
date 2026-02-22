@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import socket
+from .serialization import hilbert as hilbert_curve
 
 IGNORE_INDEX = -1
 LABEL_MAP = {
@@ -47,7 +48,13 @@ class KittiSemanticDataset(Dataset):
     PyTorch Dataset for the KITTI point cloud data.
     """
 
-    def __init__(self, root_dir: str, labels_dir: str = None, sequences: list[str] = None, training: bool = None, max_points: int = 45000):
+    def __init__(self,
+                 root_dir: str,
+                 labels_dir: str = None,
+                 sequences: list[str] = None,
+                 training: bool = None,
+                 max_points: int = 40000,
+                 sampling_strategy: str = 'hilbert'):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
@@ -57,19 +64,24 @@ class KittiSemanticDataset(Dataset):
         """
         self.root_dir = Path(root_dir)
         self.labels_dir = Path(labels_dir) if labels_dir else None
+        self.training = training
+        self.sampling_strategy = sampling_strategy.lower()
+
+        if self.sampling_strategy not in ['hilbert', 'knn']:
+            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'hilbert' or 'knn'.")
 
         # Static load balancing
         hostname = socket.gethostname()
-        self.max_points = max_points
-
+        if max_points is None:
+            self.max_points = None
+            print(f"> [Dataset] Max Points: Unlimited (Validation/Full Frame Mode)")
         # Adjust for the weaker node (Host 3)
-        if "host3" in hostname:
-            print(f"> [Optimization] Detected Straggler Node ({hostname}). Reducing max_points to 15000.")
-            self.max_points = 15000  # Cap at 15k for the 1050 Ti
+        elif "host3" in hostname:
+            print(f"> [Optimization] Detected Straggler Node ({hostname}). Reducing max_points to 10000.")
+            self.max_points = 10000  # Cap at 10k for the 1050 Ti
         else:
             print(f"> [Optimization] High-Performance Node ({hostname}). Keeping max_points at {max_points}.")
-
-        self.training = training
+            self.max_points = max_points
 
         self.point_files = []
         self.label_files = []
@@ -101,6 +113,43 @@ class KittiSemanticDataset(Dataset):
     def __len__(self):
         return len(self.point_files)
 
+    def _get_hilbert_indices(self, points, grid_size=0.01):
+        """
+        Sorts points based on Hilbert Curve index.
+        O(NlogN) selection using numpy.argsort.
+        Returns: sorted_indices (numpy array)
+        """
+        min_coord = points.min(axis=0)
+        quantized = ((points - min_coord) / grid_size).astype(int)
+        locs = torch.from_numpy(quantized).long()
+        hilbert_codes = hilbert_curve.encode(locs, num_dims=3, num_bits=16)
+        return torch.argsort(hilbert_codes).numpy()
+
+    def _get_knn_indices(self, points, k):
+        """
+        Selects k points closest to a random center point.
+        O(N) selection using numpy.argpartition.
+        Returns: sorted_indices (numpy array)
+        """
+        num_points = points.shape[0]
+
+        if num_points <= k:
+            return np.arange(num_points)
+
+        # Random center point index
+        center_idx = np.random.randint(num_points)
+        center_point = points[center_idx, :]
+
+        # Compute Euclidean distances (Vectorized)
+        # ||p - c||^2 is sufficient for ranking, avoids sqrt for speed
+        dists = np.sum((points - center_point) ** 2, axis=1)
+
+        # Find indices of the k nearest neighbors
+        idx = np.argpartition(dists, k)[:k]
+
+        return idx
+
+
     def __getitem__(self, idx):
         """
         Loads a single point cloud frame and its labels
@@ -108,6 +157,9 @@ class KittiSemanticDataset(Dataset):
         """
         point_file_path = self.point_files[idx]
         points = np.fromfile(point_file_path, dtype=np.float32).reshape(-1, 4)
+
+        # Generate Global IDs for traceability
+        original_indices = np.arange(len(points), dtype=np.int64)
 
         labels = None
         if self.labels_dir:
@@ -119,54 +171,52 @@ class KittiSemanticDataset(Dataset):
                 semantic_labels[semantic_labels_raw == raw_label] = mapped_label
 
         if self.training:
-            valid_crop = False
-            attempt_count = 0
-            original_points = points.copy()
-            original_labels = semantic_labels.copy() if labels is not None else None
-
-            # Floor
-            min_valid_points = 2000
-
-            while not valid_crop and attempt_count < 15:
-                center_idx = np.random.randint(original_points.shape[0])
-                center = original_points[center_idx, :3]
-
-                # 8 x 8 meters block
-                block_size = 8.0
-
-                min_bound = center - block_size / 2
-                max_bound = center + block_size / 2
-
-                mask = np.all((original_points[:, :3] >= min_bound) & (original_points[:, :3] <= max_bound), axis=1)
-
-                if np.sum(mask) > min_valid_points:
-                    points = original_points[mask]
-                    if labels is not None:
-                        semantic_labels = original_labels[mask]
-                    valid_crop = True
-                else:
-                    attempt_count += 1
-
-            # Fallback
-            if not valid_crop:
-                points = original_points
+            if self.sampling_strategy == 'hilbert':
+                # 1. Sort by Hilbert
+                sort_idx = self._get_hilbert_indices(points[:, :3])
+                points = points[sort_idx]
+                original_indices = original_indices[sort_idx]
                 if labels is not None:
-                    semantic_labels = original_labels
+                    semantic_labels = semantic_labels[sort_idx]
 
-        if self.max_points is not None and points.shape[0] > self.max_points:
-            # Random indices to select
-            indices = np.random.choice(points.shape[0], self.max_points, replace=False)
+                # 2. Slice Contiguous Chunk
+                total_points = points.shape[0]
+                if total_points > self.max_points:
+                    valid_range_end = total_points - self.max_points
+                    start_idx = np.random.randint(0, valid_range_end + 1)
+                    end_idx = start_idx + self.max_points
 
-            points = points[indices]
-            if labels is not None:
-                semantic_labels = semantic_labels[indices]
+                    points = points[start_idx:end_idx]
+                    original_indices = original_indices[start_idx:end_idx]
+                    if labels is not None:
+                        semantic_labels = semantic_labels[start_idx:end_idx]
 
-        coords = torch.from_numpy(points[:, :3])  # XYZ
-        feats = torch.from_numpy(points)  # XYZ + Intensity
+            elif self.sampling_strategy == 'knn':
+                # 1. Get KNN indices directly (No global sort needed)
+                knn_idx = self._get_knn_indices(points[:, :3], k=self.max_points)
 
+                points = points[knn_idx]
+                original_indices = original_indices[knn_idx]
+                if labels is not None:
+                    semantic_labels = semantic_labels[knn_idx]
+
+        else:
+            # Validation / Inference -> full frame
+            if self.sampling_strategy == 'hilbert':
+                sort_idx = self._get_hilbert_indices(points[:, :3])
+                points = points[sort_idx]
+                original_indices = original_indices[sort_idx]
+                if labels is not None:
+                    semantic_labels = semantic_labels[sort_idx]
+            # TODO: If KNN, for validation we can return the full cloud or tile it (at inference.py).
+            pass
+
+        # Prepare Output Dict
         data_dict = {
-            "coord": coords,
-            "feat": feats,
+            "coord": torch.from_numpy(points[:, :3]),
+            "feat": torch.from_numpy(points),  # XYZ + Intensity
+            "index": torch.from_numpy(original_indices),  # for fusion
+            "file_path": str(point_file_path)
         }
 
         if self.labels_dir:
