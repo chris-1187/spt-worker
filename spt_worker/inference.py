@@ -148,47 +148,94 @@ def main(args):
             full_label = data_dict['label'].to(device)
 
             total_points = full_coord.shape[0]
-            full_logits = torch.zeros((total_points, num_classes), device=device)
-            full_count = torch.zeros((total_points), device=device)
+            full_logits = torch.zeros((total_points, num_classes), device=device) # Raw, unnormalized network outputs (logits)
+            full_count = torch.zeros((total_points), device=device) # Count of evaluations per point
 
-            start = 0
             torch.cuda.synchronize()
             t_start = time.time()
 
-            while start < total_points:
-                end = min(start + chunk_size, total_points)
-                chunk_coord = full_coord[start:end]
-                chunk_feat = full_feat[start:end]
-                chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
+            if args.sampling_strategy == 'hilbert':
+                # ---------------------------------------------------------
+                # HILBERT: 1D sliding window over sorted points
+                # ---------------------------------------------------------
+                start = 0
+                while start < total_points:
+                    end = min(start + chunk_size, total_points)
+                    chunk_coord = full_coord[start:end]
+                    chunk_feat = full_feat[start:end]
+                    chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
 
-                chunk_input = {
-                    "coord": chunk_coord,
-                    "feat": chunk_feat,
-                    "batch": chunk_batch_idx,
-                    "grid_size": 0.01
-                }
+                    chunk_input = {
+                        "coord": chunk_coord,
+                        "feat": chunk_feat,
+                        "batch": chunk_batch_idx,
+                        "grid_size": 0.01
+                    }
 
-                output = model(chunk_input)
-                logits = seg_head(output.feat)
+                    output = model(chunk_input)
+                    logits = seg_head(output.feat)
 
-                full_logits[start:end] += logits
-                full_count[start:end] += 1.0
+                    full_logits[start:end] += logits
+                    full_count[start:end] += 1.0
 
-                if end == total_points:
-                    break
-                start += stride
+                    if end == total_points:
+                        break
+                    start += stride
+
+            elif args.sampling_strategy == 'knn':
+                # ---------------------------------------------------------
+                # K-NEAREST NEIGHBORS: Minimum coverage spherical algorithm
+                # ---------------------------------------------------------
+                coverage_count = torch.zeros(total_points, device=device)
+
+                while coverage_count.min() == 0:
+                    min_cov = coverage_count.min()
+                    candidate_indices = torch.nonzero(coverage_count == min_cov).squeeze(1)
+
+                    if candidate_indices.dim() == 0 or candidate_indices.numel() == 1:
+                        seed_idx = candidate_indices
+                    else:
+                        rand_pos = torch.randint(0, len(candidate_indices), (1,), device=device)
+                        seed_idx = candidate_indices[rand_pos].squeeze()
+
+                    seed_point = full_coord[seed_idx]
+                    dists = torch.sum((full_coord - seed_point) ** 2, dim=1)
+
+                    k = min(chunk_size, total_points)
+                    _, knn_indices = torch.topk(dists, k, largest=False)
+
+                    chunk_coord = full_coord[knn_indices]
+                    chunk_feat = full_feat[knn_indices]
+                    chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
+
+                    chunk_input = {
+                        "coord": chunk_coord,
+                        "feat": chunk_feat,
+                        "batch": chunk_batch_idx,
+                        "grid_size": 0.01
+                    }
+
+                    # forward pass
+                    output = model(chunk_input)
+                    logits = seg_head(output.feat)
+
+                    full_logits[knn_indices] += logits
+                    full_count[knn_indices] += 1.0
+
+                    # mark as covered
+                    coverage_count[knn_indices] += 1.0
 
             torch.cuda.synchronize()
             inference_times.append(time.time() - t_start)
 
-            final_preds = (full_logits / full_count.unsqueeze(-1)).argmax(dim=1)
+            final_preds = (full_logits / full_count.unsqueeze(-1)).argmax(dim=1) # fusion
             preds_np = final_preds.cpu().numpy()
             labels_np = full_label.cpu().numpy()
 
             valid_mask = labels_np != -1
             hist += fast_hist(preds_np[valid_mask], labels_np[valid_mask], num_classes)
 
-            # Map 0-18 indices back to standard SemanticKITTI uint32 IDs
+            # Map 0-18 indices back to standard SemanticKITTI ids
             inverse_label_map = {
                 0: 10, 1: 11, 2: 15, 3: 18, 4: 20, 5: 30, 6: 31, 7: 32,
                 8: 40, 9: 44, 10: 48, 11: 49, 12: 50, 13: 51, 14: 70,

@@ -127,8 +127,10 @@ def main(args):
             }
         }
 
-        with open(os.path.join(log_dir, "run_config.json"), "w") as f:
-            json.dump(run_config, f, indent=4)
+        if not args.resume:
+            with open(os.path.join(log_dir, "run_config.json"), "w") as f:
+                json.dump(run_config, f, indent=4)
+            print(f"> [Logging] Configuration saved to: {log_dir}/run_config.json")
 
         print(f"> [Logging] Configuration saved to: {log_dir}/run_config.json")
         print(f"> [Logging] Metrics will be saved to: {log_dir}/metrics.jsonl")
@@ -188,6 +190,30 @@ def main(args):
 
     criterion = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
+    start_epoch = 0
+    if args.resume and os.path.isfile(args.resume):
+        if is_main_process:
+            print(f"> [Resume] Loading checkpoint from {args.resume}")
+
+        # Load the checkpoint
+        checkpoint = torch.load(args.resume, map_location=device)
+
+        # Unwrap DDP if necessary to load weights
+        model_to_load = model.module if is_distributed() else model
+        seg_head_to_load = seg_head.module if is_distributed() else seg_head
+
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        seg_head_to_load.load_state_dict(checkpoint['seg_head_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        start_epoch = checkpoint['epoch'] + 1
+
+        if is_main_process:
+            print(f"> [Resume] Successfully loaded. Resuming training from epoch {start_epoch + 1}")
+
     # GRAD ACCUM: Calculate effective batch size
     effective_batch_size = args.batch_size * args.accumulation_steps * world_size
     if is_main_process:
@@ -196,7 +222,7 @@ def main(args):
         print("> --- Training started ---")
 
     # Training loop
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         epoch_start_time = time.time()
 
         if is_distributed():
@@ -341,6 +367,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for the DataLoader.")
 
     parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights, metrics, and logs.")
+    parser.add_argument('--resume', type=str, default=None,
+                        help="Path to checkpoint .pt file to resume training from.")
     parser.add_argument('--sampling_strategy', type=str, default='hilbert',
                         choices=['hilbert', 'knn'],
                         help="Strategy to sample point chunks: 'hilbert' (curve slicing) or 'knn' (k-nearest neighbors).")
