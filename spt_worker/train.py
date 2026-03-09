@@ -118,7 +118,7 @@ def main(args):
                 "effective_batch_size": effective_batch_size,
                 "world_size": world_size,
                 "accumulation_steps": args.accumulation_steps,
-                "local_batch_size": 1 # Hardcoded
+                "local_batch_size": 1
             },
             "environment": {
                 "pytorch_version": torch.__version__,

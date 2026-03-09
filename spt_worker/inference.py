@@ -53,15 +53,6 @@ def main(args):
     chunk_size = args.chunk_size
     stride = chunk_size - args.overlap_size
 
-    # --- 1. Dynamic Host Configuration --- TODO: distributed
-    #hostname = socket.gethostname()
-    #if "host3" in hostname:
-    #    CHUNK_SIZE = 10000
-    #    print(f"> [Config] Detected Host3. Chunk size set to {CHUNK_SIZE}")
-    #else:
-    #    CHUNK_SIZE = 40000
-    #    print(f"> [Config] Detected High-Perf Node. Chunk size set to {CHUNK_SIZE}")
-
     print(f"> [Inference] Loading checkpoint: {args.checkpoint_path}")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
 
@@ -108,7 +99,9 @@ def main(args):
         sequences=args.sequences,
         training=False,
         max_points=None,
-        sampling_strategy=args.sampling_strategy
+        sampling_strategy=args.sampling_strategy,
+        start_idx = args.start_idx,
+        end_idx = args.end_idx
     )
 
     dataloader = DataLoader(
@@ -251,35 +244,30 @@ def main(args):
 
             preds_kitti.tofile(os.path.join(save_dir, frame_name))
 
-    # Final Metrics
-    ious = per_class_iu(hist) * 100
-    accs = per_class_acc(hist) * 100
-
-    # Construct JSON payload
-    inference_metrics = {
-        "event": "evaluation_completed",
-        "timestamp": datetime.now().isoformat(),
-        "parameters": {
-            "chunk_size": chunk_size,
-            "overlap_size": args.overlap_size,
-            "sampling_strategy": args.sampling_strategy,
-            "sequences": args.sequences
-        },
-        "results": {
-            "overall_accuracy": round(np.diag(hist).sum() / hist.sum() * 100, 4),
-            "mean_accuracy": round(np.nanmean(accs), 4),
-            "mean_iou": round(np.nanmean(ious), 4),
-            "average_latency_ms": round(np.mean(inference_times) * 1000, 4),
-            "per_class_iou": {str(i): round(val, 4) for i, val in enumerate(ious)},
-            "per_class_acc": {str(i): round(val, 4) for i, val in enumerate(accs)}
+        # Construct JSON payload with raw counts
+        node_metrics = {
+            "node_name": args.node_name,
+            "parameters": {
+                "chunk_size": chunk_size,
+                "overlap_size": args.overlap_size,
+                "sampling_strategy": args.sampling_strategy,
+                "sequences": args.sequences,
+                "start_idx": args.start_idx,
+                "end_idx": args.end_idx
+            },
+            "raw_metrics": {
+                "hist": hist.tolist(),  # raw confusion matrix
+                "total_inference_time_sec": sum(inference_times),
+                "total_frames": len(inference_times)
+            }
         }
-    }
 
-    metrics_file = os.path.join(inference_dir, "evaluation_metrics.json")
-    with open(metrics_file, "w") as f:
-        json.dump(inference_metrics, f, indent=4)
+        # Save as a node-specific partial file
+        metrics_file = os.path.join(inference_dir, f"evaluation_metrics_{args.node_name}.json")
+        with open(metrics_file, "w") as f:
+            json.dump(node_metrics, f, indent=4)
 
-    print(f"> [Inference] Evaluation complete. Metrics appended to {metrics_file}")
+        print(f"> [Inference] Worker {args.node_name} complete. Wrote partial metrics to {metrics_file}")
 
 
 if __name__ == "__main__":
@@ -294,5 +282,8 @@ if __name__ == "__main__":
     parser.add_argument('--chunk_size', type=int, default=40000)
     parser.add_argument('--overlap_size', type=int, default=2000)
     parser.add_argument('--sampling_strategy', type=str, default='hilbert')
+    parser.add_argument('--start_idx', type=int, default=None, help="Start frame index for this worker")
+    parser.add_argument('--end_idx', type=int, default=None, help="End frame index for this worker")
+    parser.add_argument('--node_name', type=str, required=True, help="Name of the worker node")
     args = parser.parse_args()
     main(args)

@@ -54,7 +54,9 @@ class KittiSemanticDataset(Dataset):
                  sequences: list[str] = None,
                  training: bool = None,
                  max_points: int = 40000,
-                 sampling_strategy: str = 'hilbert'):
+                 sampling_strategy: str = 'hilbert',
+                 start_idx: int = None,
+                 end_idx: int = None):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
@@ -104,6 +106,13 @@ class KittiSemanticDataset(Dataset):
             self.point_files.sort()
             if self.labels_dir:
                 self.label_files.sort()
+
+            if start_idx is not None and end_idx is not None:
+                self.point_files = self.point_files[start_idx:end_idx]
+                if self.labels_dir:
+                    self.label_files = self.label_files[start_idx:end_idx]
+                print(
+                    f"> [Distributed Inference] Worker assigned {len(self.point_files)} frames (Indices {start_idx} to {end_idx - 1})")
 
         if self.labels_dir:
             assert len(self.point_files) > 0, "No point cloud files found."
@@ -171,7 +180,9 @@ class KittiSemanticDataset(Dataset):
                 semantic_labels[semantic_labels_raw == raw_label] = mapped_label
 
         if self.training:
+
             if self.sampling_strategy == 'hilbert':
+
                 # 1. Sort by Hilbert
                 sort_idx = self._get_hilbert_indices(points[:, :3])
                 points = points[sort_idx]
@@ -192,6 +203,7 @@ class KittiSemanticDataset(Dataset):
                         semantic_labels = semantic_labels[start_idx:end_idx]
 
             elif self.sampling_strategy == 'knn':
+
                 # 1. Get KNN indices directly (No global sort needed)
                 knn_idx = self._get_knn_indices(points[:, :3], k=self.max_points)
 
@@ -202,12 +214,14 @@ class KittiSemanticDataset(Dataset):
 
         else:
             # Validation / Inference -> full frame
+
             if self.sampling_strategy == 'hilbert':
                 sort_idx = self._get_hilbert_indices(points[:, :3])
                 points = points[sort_idx]
                 original_indices = original_indices[sort_idx]
                 if labels is not None:
                     semantic_labels = semantic_labels[sort_idx]
+
             # TODO: If KNN, for validation we can return the full cloud or tile it (at inference.py).
             pass
 
