@@ -251,6 +251,10 @@ def main(args):
             labels = data_dict["label"]
             loss = criterion(logits, labels)
 
+            if torch.isnan(loss):
+                print(f"> [Warning] NaN loss on Rank {rank} at batch {i}. Injecting connected zero-loss.")
+                loss = (logits * 0.0).sum()
+
             # Tack loss of current batch to average later
             epoch_loss_sum += loss.item()
             num_batches += 1
@@ -369,9 +373,9 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default="_outputs", help="Directory to save trained weights, metrics, and logs.")
     parser.add_argument('--resume', type=str, default=None,
                         help="Path to checkpoint .pt file to resume training from.")
-    parser.add_argument('--sampling_strategy', type=str, default='hilbert',
-                        choices=['hilbert', 'knn'],
-                        help="Strategy to sample point chunks: 'hilbert' (curve slicing) or 'knn' (k-nearest neighbors).")
+    parser.add_argument('--sampling_strategy', type=str, default='block',
+                        choices=['block', 'hilbert', 'fps_knn', 'voxel_knn'],
+                        help="Strategy to sample point chunks: 'block', 'hilbert', 'fps_knn', 'voxel_knn'.")
 
     args = parser.parse_args()
 

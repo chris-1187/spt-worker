@@ -53,7 +53,7 @@ class KittiSemanticDataset(Dataset):
                  labels_dir: str = None,
                  sequences: list[str] = None,
                  training: bool = None,
-                 max_points: int = 40000,
+                 max_points: int = 10240,
                  sampling_strategy: str = 'hilbert',
                  start_idx: int = None,
                  end_idx: int = None):
@@ -69,9 +69,10 @@ class KittiSemanticDataset(Dataset):
         self.training = training
         self.sampling_strategy = sampling_strategy.lower()
 
-        if self.sampling_strategy not in ['hilbert', 'knn']:
-            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'hilbert' or 'knn'.")
+        if self.sampling_strategy not in ['block', 'hilbert', 'fps_knn', 'voxel_knn']:
+            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'block', 'hilbert', 'fps_knn' or 'voxel_knn'.")
 
+        """
         # Static load balancing
         hostname = socket.gethostname()
         if max_points is None:
@@ -84,7 +85,9 @@ class KittiSemanticDataset(Dataset):
         else:
             print(f"> [Optimization] High-Performance Node ({hostname}). Keeping max_points at {max_points}.")
             self.max_points = max_points
+        """
 
+        self.max_points = max_points
         self.point_files = []
         self.label_files = []
 
@@ -158,6 +161,39 @@ class KittiSemanticDataset(Dataset):
 
         return idx
 
+    def _get_block_indices(self, points, block_size_m=8.0, min_points=1024):
+        """
+        Selects points within a random square spatial block.
+        """
+        num_points = points.shape[0]
+        idx = np.array([])
+
+        for _ in range(10):
+            center_idx = np.random.randint(num_points)
+            center_point = points[center_idx, :]
+
+            min_bound = center_point - (block_size_m / 2)
+            max_bound = center_point + (block_size_m / 2)
+
+            mask = (points[:, 0] >= min_bound[0]) & (points[:, 0] < max_bound[0]) & \
+                   (points[:, 1] >= min_bound[1]) & (points[:, 1] < max_bound[1])
+
+            idx = np.nonzero(mask)[0]
+
+            # break if dense enough
+            if len(idx) >= min_points:
+                break
+
+        if len(idx) == 0:
+            idx = np.array([center_idx])
+
+        # downsample if needed
+        if len(idx) > self.max_points:
+            np.random.shuffle(idx)
+            idx = idx[:self.max_points]
+
+        return idx
+
 
     def __getitem__(self, idx):
         """
@@ -166,8 +202,7 @@ class KittiSemanticDataset(Dataset):
         """
         point_file_path = self.point_files[idx]
         points = np.fromfile(point_file_path, dtype=np.float32).reshape(-1, 4)
-
-        # Generate Global IDs for traceability
+        # global ids for traceability
         original_indices = np.arange(len(points), dtype=np.int64)
 
         labels = None
@@ -180,9 +215,14 @@ class KittiSemanticDataset(Dataset):
                 semantic_labels[semantic_labels_raw == raw_label] = mapped_label
 
         if self.training:
+            if self.sampling_strategy == 'block':
+                block_idx = self._get_block_indices(points[:, :3], block_size_m=8.0)
+                points = points[block_idx]
+                original_indices = original_indices[block_idx]
+                if labels is not None:
+                    semantic_labels = semantic_labels[block_idx]
 
-            if self.sampling_strategy == 'hilbert':
-
+            elif self.sampling_strategy == 'hilbert':
                 # 1. Sort by Hilbert
                 sort_idx = self._get_hilbert_indices(points[:, :3])
                 points = points[sort_idx]
@@ -203,27 +243,13 @@ class KittiSemanticDataset(Dataset):
                         semantic_labels = semantic_labels[start_idx:end_idx]
 
             elif self.sampling_strategy == 'knn':
-
                 # 1. Get KNN indices directly (No global sort needed)
                 knn_idx = self._get_knn_indices(points[:, :3], k=self.max_points)
-
                 points = points[knn_idx]
                 original_indices = original_indices[knn_idx]
                 if labels is not None:
                     semantic_labels = semantic_labels[knn_idx]
 
-        else:
-            # Validation / Inference -> full frame
-
-            if self.sampling_strategy == 'hilbert':
-                sort_idx = self._get_hilbert_indices(points[:, :3])
-                points = points[sort_idx]
-                original_indices = original_indices[sort_idx]
-                if labels is not None:
-                    semantic_labels = semantic_labels[sort_idx]
-
-            # TODO: If KNN, for validation we can return the full cloud or tile it (at inference.py).
-            pass
 
         # Prepare Output Dict
         data_dict = {
