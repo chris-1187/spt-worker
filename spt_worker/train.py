@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 # modules
 from .dataset import KittiSemanticDataset
@@ -181,12 +182,40 @@ def main(args):
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(seg_head.parameters()),
-        lr=args.learning_rate
+        lr=args.learning_rate,
+        weight_decay=0.01  # Standard regularization for AdamW
     )
 
-    step_size = int(args.epochs * 0.3)
-    if step_size < 1: step_size = 1
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
+    # learning rate schedule (Warmup + Cosine Decay)
+
+    total_steps_per_epoch = len(dataloader) // args.accumulation_steps
+
+    # warmup phase: first 5% of training
+    warmup_epochs = max(1, int(args.epochs * 0.05))
+    warmup_steps = warmup_epochs * total_steps_per_epoch
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=warmup_steps
+    )
+
+    # cosine decay phase
+    decay_epochs = args.epochs - warmup_epochs
+    decay_steps = decay_epochs * total_steps_per_epoch
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=decay_steps,
+        eta_min=1e-6
+    )
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
+    )
 
     criterion = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
@@ -218,7 +247,8 @@ def main(args):
     effective_batch_size = args.batch_size * args.accumulation_steps * world_size
     if is_main_process:
         print(f"> Effective Batch Size: {effective_batch_size} (batch_size * accumulation_steps * world_size)")
-        print(f"> Scheduler enabled. LR will decay every {step_size} epochs.")
+        print(
+            f"> Scheduler enabled: Linear Warmup ({warmup_epochs} epochs) -> Cosine Decay ({decay_epochs} epochs).")
         print("> --- Training started ---")
 
     # Training loop
@@ -267,14 +297,31 @@ def main(args):
             if (i + 1) % args.accumulation_steps == 0 or (i + 1) == len(dataloader):
 
                 optimizer.step()
+                scheduler.step()  # update lr per batch
                 optimizer.zero_grad()
 
+                # only print and save step metrics every 10 effective steps
                 if is_main_process and (i + 1) // args.accumulation_steps % 10 == 0:
                     current_loss = loss.item() * args.accumulation_steps
-                    print(
-                        f"> Epoch: {epoch + 1}/{args.epochs} | Step: {(i + 1) // args.accumulation_steps} | Approx Loss: {current_loss:.4f}")
+                    current_step_lr = scheduler.get_last_lr()[0]
+                    current_step = (i + 1) // args.accumulation_steps
 
-        scheduler.step()
+                    print(
+                        f"> Epoch: {epoch + 1}/{args.epochs} "
+                        f"| Step: {current_step} "
+                        f"| Approx Loss: {current_loss:.4f} "
+                        f"| LR: {current_step_lr:.7f}"
+                    )
+
+                    global_step = (epoch * total_steps_per_epoch) + current_step
+                    step_stats = {
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "learning_rate": current_step_lr,
+                        "loss": current_loss
+                    }
+                    with open(os.path.join(log_dir, "step_metrics.jsonl"), "a") as f:
+                        f.write(json.dumps(step_stats) + "\n")
 
         if rank == 0:
             epoch_duration = time.time() - epoch_start_time

@@ -281,6 +281,63 @@ class AverageLogitMerger(PredictionMerger):
         return final_preds
 
 
+class HardUncertaintyMerger(PredictionMerger):
+    """
+    Hard Uncertainty Selection
+    Retains the prediction from the tile that exhibits the lowest predictive entropy.
+    """
+    def __init__(self, total_points: int, num_classes: int, device: torch.device):
+        super().__init__(total_points, num_classes, device)
+        self.best_entropy = torch.full((total_points,), float('inf'), device=device)
+        self.best_probs = torch.zeros((total_points, num_classes), device=device)
+
+    def update(self, indices: torch.Tensor, **kwargs):
+        expected_probs = kwargs['expected_probs']
+        entropy = kwargs['uncertainty']
+
+        # identify which points in the incoming chunk have better (lower) entropy
+        current_best_entropy = self.best_entropy[indices]
+        update_mask = entropy < current_best_entropy
+
+        if update_mask.any():
+            global_update_indices = indices[update_mask]
+            self.best_entropy[global_update_indices] = entropy[update_mask]
+            self.best_probs[global_update_indices] = expected_probs[update_mask]
+
+    def get_final_predictions(self) -> torch.Tensor:
+        return self.best_probs.argmax(dim=1)
+
+
+class SoftUncertaintyMerger(PredictionMerger):
+    """
+    Inverse Uncertainty Weighting (Soft Selection)
+    Fuses probabilities using weights inversely proportional to predictive entropy.
+    """
+    def __init__(self, total_points: int, num_classes: int, device: torch.device):
+        super().__init__(total_points, num_classes, device)
+        self.weighted_probs = torch.zeros((total_points, num_classes), device=device)
+        self.sum_weights = torch.zeros((total_points, 1), device=device)
+        self.eps = 1e-8  # preventing division by zero for highly confident predictions
+
+    def update(self, indices: torch.Tensor, **kwargs):
+        expected_probs = kwargs['expected_probs']
+        entropy = kwargs['uncertainty']
+
+        # calculate inverse uncertainty weights
+        weights = 1.0 / (entropy + self.eps)
+        weights = weights.unsqueeze(1)  # [N, 1]
+
+        self.weighted_probs[indices] += expected_probs * weights
+        self.sum_weights[indices] += weights
+
+    def get_final_predictions(self) -> torch.Tensor:
+        valid_mask = self.sum_weights.squeeze(1) > 0
+        final_probs = torch.zeros_like(self.weighted_probs)
+        final_probs[valid_mask] = self.weighted_probs[valid_mask] / self.sum_weights[valid_mask]
+
+        return final_probs.argmax(dim=1)
+
+
 ### Strategy getter
 
 def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
@@ -301,10 +358,17 @@ def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
     else:
         raise ValueError(f"Unknown sampling strategy: {strategy}")
 
-def get_merger(strategy: str, total_points: int, num_classes: int, device: torch.device) -> PredictionMerger:
+def get_merger(strategy: str, method: str, total_points: int, num_classes: int, device: torch.device) -> PredictionMerger:
     strategy = strategy.lower()
     if strategy == 'logit_average':
         return AverageLogitMerger(total_points, num_classes, device)
+    elif strategy == 'mc_uncertainty':
+        if method.lower() == 'hard':
+            return HardUncertaintyMerger(total_points, num_classes, device)
+        elif method.lower() == 'soft':
+            return SoftUncertaintyMerger(total_points, num_classes, device)
+        else:
+            raise ValueError(f"Unknown MC uncertainty method: {method}. Use 'hard' or 'soft'.")
     else:
         raise ValueError(f"Unknown fusion strategy: {strategy}")
 
@@ -435,6 +499,14 @@ def main(args):
         71, 72, 80, 81
     ], dtype=np.uint32)
 
+    use_mc_dropout = args.fusion_strategy == 'mc_uncertainty'
+    if use_mc_dropout:
+        print(f"> [MC Dropout] Enabled with {args.mc_passes} stochastic forward passes per chunk.")
+        # Set Dropout layers into train() mode to enable stochastic sampling, while leaving BatchNorm/LayerNorm in eval() mode
+        for m in model.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()
+
     with torch.no_grad():
         for i, data_dict in tqdm(enumerate(dataloader), total=len(dataloader)):
             full_coord = data_dict['coord'].to(device)
@@ -451,7 +523,13 @@ def main(args):
             )
 
             # initialize fusion
-            fusion = get_merger("logit_average", total_points, num_classes, device)
+            fusion = get_merger(
+                args.fusion_strategy,
+                args.fusion_method,
+                total_points,
+                num_classes,
+                device
+            )
 
             torch.cuda.synchronize()
             t_start = time.time()
@@ -468,12 +546,29 @@ def main(args):
                     "grid_size": 0.01
                 }
 
-                # Forward pass
-                output = model(chunk_input)
-                logits = seg_head(output.feat)
+                if use_mc_dropout:
+                    chunk_probs_list = []
+                    # run M stochastic passes
+                    for _ in range(args.mc_passes):
+                        output = model(chunk_input)
+                        logits = seg_head(output.feat)
+                        chunk_probs_list.append(torch.softmax(logits, dim=1))
 
-                # Accumulate
-                fusion.update(chunk_idx, logits, chunk_coord)
+                    # per-tile prediction and uncertainty calculation
+                    stacked_probs = torch.stack(chunk_probs_list, dim=0)  # [M, N, C]
+                    expected_probs = stacked_probs.mean(dim=0)  # [N, C]
+
+                    # Shannon Entropy: -sum(P * log(P))
+                    eps = 1e-10
+                    entropy = -torch.sum(expected_probs * torch.log(expected_probs + eps), dim=1)  # [N]
+
+                    fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
+
+                else:
+                    # logit averaging baseline
+                    output = model(chunk_input)
+                    logits = seg_head(output.feat)
+                    fusion.update(chunk_idx, chunk_logits=logits)
 
             torch.cuda.synchronize()
             inference_times.append(time.time() - t_start)
@@ -503,6 +598,9 @@ def main(args):
                 "chunk_size": chunk_size,
                 "overlap_size": args.overlap_size,
                 "sampling_strategy": args.sampling_strategy,
+                "fusion_strategy": args.fusion_strategy,
+                "fusion_method": args.fusion_method,
+                "mc_passes": args.mc_passes,
                 "sequences": args.sequences,
                 "start_idx": args.start_idx,
                 "end_idx": args.end_idx
@@ -534,6 +632,9 @@ if __name__ == "__main__":
     parser.add_argument('--chunk_size', type=int, default=40000)
     parser.add_argument('--overlap_size', type=int, default=2000)
     parser.add_argument('--sampling_strategy', type=str, default='hilbert')
+    parser.add_argument('--fusion_strategy', type=str, default='mc_uncertainty', choices=['logit_average', 'mc_uncertainty'])
+    parser.add_argument('--fusion_method', type=str, default='soft', choices=['soft', 'hard'])
+    parser.add_argument('--mc_passes', type=int, default=10)
     parser.add_argument('--start_idx', type=int, default=None, help="Start frame index for this worker")
     parser.add_argument('--end_idx', type=int, default=None, help="End frame index for this worker")
     parser.add_argument('--node_name', type=str, required=True, help="Name of the worker node")
