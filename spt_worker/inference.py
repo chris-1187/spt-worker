@@ -570,6 +570,67 @@ def main(args):
                     logits = seg_head(output.feat)
                     fusion.update(chunk_idx, chunk_logits=logits)
 
+            # iterative cleanup for kNN strategies for 100% coverage
+            def get_missed_mask(fusion_merger):
+                if isinstance(fusion_merger, AverageLogitMerger):
+                    return fusion_merger.full_count.squeeze(1) == 0
+                elif isinstance(fusion_merger, HardUncertaintyMerger):
+                    return fusion_merger.best_entropy == float('inf')
+                elif isinstance(fusion_merger, SoftUncertaintyMerger):
+                    return fusion_merger.sum_weights.squeeze(1) == 0
+                return torch.zeros(total_points, dtype=torch.bool, device=device)
+
+            missed_mask = get_missed_mask(fusion)
+            cleanup_iterations = 0
+
+            while missed_mask.any():
+                cleanup_iterations += 1
+                missed_indices = torch.nonzero(missed_mask).squeeze(1)
+
+                # pick first missed point as center of a new chunk
+                anchor_idx = missed_indices[0]
+                anchor_point = full_coord[anchor_idx].unsqueeze(0)
+
+                dists = torch.cdist(anchor_point, full_coord)
+                _, chunk_idx = torch.topk(dists, k=chunk_size, largest=False, dim=1)
+                chunk_idx = chunk_idx.squeeze(0)
+
+                chunk_coord = full_coord[chunk_idx]
+                chunk_feat = full_feat[chunk_idx]
+                chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
+
+                chunk_input = {
+                    "coord": chunk_coord,
+                    "feat": chunk_feat,
+                    "batch": chunk_batch_idx,
+                    "grid_size": 0.01
+                }
+
+                if use_mc_dropout:
+                    chunk_probs_list = []
+                    for _ in range(args.mc_passes):
+                        output = model(chunk_input)
+                        logits = seg_head(output.feat)
+                        chunk_probs_list.append(torch.softmax(logits, dim=1))
+
+                    stacked_probs = torch.stack(chunk_probs_list, dim=0)
+                    expected_probs = stacked_probs.mean(dim=0)
+                    eps = 1e-10
+                    entropy = -torch.sum(expected_probs * torch.log(expected_probs + eps), dim=1)
+
+                    fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
+                else:
+                    output = model(chunk_input)
+                    logits = seg_head(output.feat)
+                    fusion.update(chunk_idx, chunk_logits=logits)
+
+                # check which points are still missing
+                missed_mask = get_missed_mask(fusion)
+
+            if cleanup_iterations > 0:
+                print(
+                    f"  -> [System] Required {cleanup_iterations} knn cleanup passes to achieve 100% coverage")
+
             torch.cuda.synchronize()
             inference_times.append(time.time() - t_start)
 

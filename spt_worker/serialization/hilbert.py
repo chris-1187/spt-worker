@@ -113,6 +113,9 @@ def encode(locs, num_dims, num_bits):
      The output is an ndarray of uint64 integers with the same shape as the
      input, excluding the last dimension, which needs to be num_dims.
     """
+    # Safeguard
+    if num_bits <= 0:
+        return torch.zeros(locs.shape[:-1], dtype=torch.int64, device=locs.device)
 
     # Keep around the original shape for later.
     orig_shape = locs.shape
@@ -221,6 +224,10 @@ def decode(hilberts, num_dims, num_bits):
      The output is an ndarray of unsigned integers with the same shape as hilberts
      but with an additional dimension of size num_dims.
     """
+
+    hilberts = torch.atleast_1d(hilberts)
+    if num_bits <= 0:
+        return torch.zeros((*hilberts.shape, num_dims), dtype=torch.int64, device=hilberts.device)
 
     if num_dims * num_bits > 64:
         raise ValueError(

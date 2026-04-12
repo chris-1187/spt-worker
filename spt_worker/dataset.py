@@ -242,8 +242,7 @@ class KittiSemanticDataset(Dataset):
                     if labels is not None:
                         semantic_labels = semantic_labels[start_idx:end_idx]
 
-            elif self.sampling_strategy == 'knn':
-                # 1. Get KNN indices directly (No global sort needed)
+            elif self.sampling_strategy in ['knn', 'fps_knn', 'voxel_knn']:
                 knn_idx = self._get_knn_indices(points[:, :3], k=self.max_points)
                 points = points[knn_idx]
                 original_indices = original_indices[knn_idx]
