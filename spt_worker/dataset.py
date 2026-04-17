@@ -69,7 +69,7 @@ class KittiSemanticDataset(Dataset):
         self.training = training
         self.sampling_strategy = sampling_strategy.lower()
 
-        if self.sampling_strategy not in ['block', 'hilbert', 'fps_knn', 'voxel_knn']:
+        if self.sampling_strategy not in ['block', 'hilbert', 'fps_knn', 'voxel_knn', 'nuc_knn', 'kdtree_knn']:
             raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'block', 'hilbert', 'fps_knn' or 'voxel_knn'.")
 
         """

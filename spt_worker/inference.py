@@ -41,11 +41,16 @@ class PredictionMerger(ABC):
         self.total_points = total_points
         self.num_classes = num_classes
         self.device = device
+        self.prediction_counts = torch.zeros(total_points, dtype=torch.long, device=device)
 
     @abstractmethod
     def update(self, indices: torch.Tensor, chunk_logits: torch.Tensor, chunk_coords: torch.Tensor = None):
         # updates the global state with predictions from a single chunk
         pass
+
+    def get_average_oversampling(self) -> float:
+        # average number of times a point was predicted across the frame
+        return self.prediction_counts.float().mean().item()
 
     @abstractmethod
     def get_final_predictions(self) -> torch.Tensor:
@@ -57,11 +62,13 @@ class PredictionMerger(ABC):
 
 class SlidingBlockSampler(PointChunkSampler):
     """
-    Slides a spatial block over the point cloud (ignoring z-axis).
-    Overlap is defined in meters.
+    Equal Grid Slicing Strategy (Baseline).
+    Slides a fixed-size spatial block over the point cloud (ignoring z-axis).
+    If a block exceeds the chunk limit, points are randomly dropped to fit.
+    Empty blocks are ignored.
     """
 
-    def __init__(self, chunk_size: int, block_size_m: float = 8.0, overlap_m: float = 1.0, **kwargs):
+    def __init__(self, chunk_size: int, block_size_m: float = 8.0, overlap_m: float = 0.5, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.block_size_m = block_size_m
         self.overlap_m = overlap_m
@@ -74,32 +81,31 @@ class SlidingBlockSampler(PointChunkSampler):
         min_xyz = full_coord.min(dim=0)[0]
         max_xyz = full_coord.max(dim=0)[0]
 
-        # Slide across X and Y axis
+        # slide across X and Y axis
         x_curr = min_xyz[0].item()
 
         while x_curr < max_xyz[0].item():
             y_curr = min_xyz[1].item()
 
             while y_curr < max_xyz[1].item():
-                # Define spatial block size block
+                # define spatial block bounding box
                 x_min, x_max = x_curr, x_curr + self.block_size_m
                 y_min, y_max = y_curr, y_curr + self.block_size_m
 
-                # Boolean mask for points inside the bounding box
+                # boolean mask for points inside the bounding box
                 mask = (full_coord[:, 0] >= x_min) & (full_coord[:, 0] < x_max) & \
                        (full_coord[:, 1] >= y_min) & (full_coord[:, 1] < y_max)
 
                 indices = torch.nonzero(mask).squeeze(1)
 
+                # drop empty tiles
                 if len(indices) > 0:
-                    # Limit chunk size
+                    # downsample randomly to chunk_size
                     if len(indices) > self.chunk_size:
-                        # Shuffle indices to ensure uniform sub-sampling across the block
-                        indices = indices[torch.randperm(len(indices))]
-                        for i in range(0, len(indices), self.chunk_size):
-                            yield indices[i: i + self.chunk_size]
-                    else:
-                        yield indices
+                        perm = torch.randperm(len(indices), device=indices.device)[:self.chunk_size]
+                        indices = indices[perm]
+
+                    yield indices
 
                 y_curr += self.stride_m
             x_curr += self.stride_m
@@ -112,7 +118,7 @@ class HilbertSampler(PointChunkSampler):
     Overlap is defined in points.
     """
 
-    def __init__(self, chunk_size: int, overlap_points: int = 2000, grid_size: float = 0.01, **kwargs):
+    def __init__(self, chunk_size: int, overlap_points: int = 5000, grid_size: float = 0.01, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.overlap_points = overlap_points
         self.stride = chunk_size - overlap_points
@@ -152,7 +158,7 @@ class FPSKNNSampler(PointChunkSampler):
     Overlap is defined indirectly by an oversampling factor.
     """
 
-    def __init__(self, chunk_size: int, oversample_factor: float = 1.5, **kwargs):
+    def __init__(self, chunk_size: int, oversample_factor: float = 4.0, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.oversample_factor = oversample_factor
 
@@ -227,12 +233,19 @@ class VoxelKNNSampler(PointChunkSampler):
 
         # quantize points to voxel indices and extract the unique occupied voxels
         voxel_indices = torch.floor(shifted_coord / self.voxel_size).int()
-        unique_voxels = torch.unique(voxel_indices, dim=0)
+        unique_voxels, counts = torch.unique(voxel_indices, dim=0, return_counts=True)
+        min_points_threshold = 50
+        valid_mask = counts >= min_points_threshold
+        unique_voxels = unique_voxels[valid_mask]
+
+        # failsafe
+        if len(unique_voxels) == 0:
+            unique_voxels = torch.unique(voxel_indices, dim=0)
 
         # get voxel centers
         voxel_centers = (unique_voxels.float() + 0.5) * self.voxel_size + min_coord
 
-        # get closest points for each voxel center by computing the distance from all voxel centers to all points
+        # get closest points for each voxel center
         dists_to_centers = torch.cdist(voxel_centers, full_coord)
 
         # argmin gives the index of the real point closest to each geometric center
@@ -240,6 +253,151 @@ class VoxelKNNSampler(PointChunkSampler):
         anchors = full_coord[anchor_indices]  # [V, 3]
 
         # get k nearest neighbors around each anchor
+        dists_to_anchors = torch.cdist(anchors, full_coord)
+        _, knn_indices = torch.topk(dists_to_anchors, k=self.chunk_size, largest=False, dim=1)
+
+        for i in range(anchors.shape[0]):
+            yield knn_indices[i]
+
+class KDTreeKNNSampler(PointChunkSampler):
+    """
+    Recursive KD-Tree spatial partitioning.
+    Divides the point cloud along its widest axis at the median point until every spatial leaf contains fewer than `leaf_size` points.
+    Then extracts the geometric centroid of each leaf as a kNN anchor.
+    """
+    def __init__(self, chunk_size: int, leaf_size: int = 4000, **kwargs):
+        super().__init__(chunk_size, **kwargs)
+        self.leaf_size = leaf_size
+
+    def _build_tree_and_get_centroids(self, coords: torch.Tensor) -> list:
+        num_points = coords.shape[0]
+
+        # leaf node has dropped below the target leaf_size threshold
+        if num_points <= self.leaf_size:
+            return [coords.mean(dim=0)]
+
+        # find the dimension with the largest physical spatial extent
+        mins = coords.min(dim=0)[0]
+        maxs = coords.max(dim=0)[0]
+        extents = maxs - mins
+        split_dim = torch.argmax(extents).item()
+
+        # find median value along that dimension to ensure 50/50 point split
+        median_val = torch.median(coords[:, split_dim])
+
+        # boolean masks to split the points
+        left_mask = coords[:, split_dim] < median_val
+        right_mask = ~left_mask
+
+        if not left_mask.any() or not right_mask.any():
+            return [coords.mean(dim=0)]
+
+        # recursive call into sub-boxes
+        left_centroids = self._build_tree_and_get_centroids(coords[left_mask])
+        right_centroids = self._build_tree_and_get_centroids(coords[right_mask])
+
+        return left_centroids + right_centroids
+
+    def generate_chunks(self, full_coord: torch.Tensor) -> Iterator[torch.Tensor]:
+        total_points = full_coord.shape[0]
+        if total_points <= self.chunk_size:
+            yield torch.arange(total_points, device=full_coord.device)
+            return
+
+        # generate leaf centroids recursively
+        centroids_list = self._build_tree_and_get_centroids(full_coord)
+        voxel_centers = torch.stack(centroids_list)
+
+        # get anchors
+        dists_to_centers = torch.cdist(voxel_centers, full_coord)
+        anchor_indices = torch.argmin(dists_to_centers, dim=1)
+        anchors = full_coord[anchor_indices]
+
+        # get kNN Spheres around the anchors
+        dists_to_anchors = torch.cdist(anchors, full_coord)
+        _, knn_indices = torch.topk(dists_to_anchors, k=self.chunk_size, largest=False, dim=1)
+
+        for i in range(anchors.shape[0]):
+            yield knn_indices[i]
+
+
+class NUCVoxelKNNSampler(PointChunkSampler):
+    """
+    Non-uniform cylindrical approach using Arithmetic Progression of Interval (API) Strategy.
+    Dynamically expands voxel boundaries radially to adjust to non-unform LiDAR point distribution.
+    """
+
+    def __init__(self, chunk_size: int, a0: float = 2.0, d: float = 1.0, angular_bins: int = 6, z_bins: int = 1,
+                 **kwargs):
+        super().__init__(chunk_size, **kwargs)
+        self.a0 = a0  # initial voxel width at sensor
+        self.d = d  # radial expansion steps
+        self.angular_bins = angular_bins
+        self.z_bins = z_bins
+
+    def generate_chunks(self, full_coord: torch.Tensor) -> Iterator[torch.Tensor]:
+        total_points = full_coord.shape[0]
+        if total_points <= self.chunk_size:
+            yield torch.arange(total_points, device=full_coord.device)
+            return
+
+        x = full_coord[:, 0]
+        y = full_coord[:, 1]
+        z = full_coord[:, 2]
+
+        # transform to cylindrical coordinates (r, theta, z)
+        r = torch.sqrt(x ** 2 + y ** 2)
+        theta = torch.atan2(y, x)
+
+        # API radial quantization
+        discriminant = (self.a0 - 0.5 * self.d) ** 2 + 2 * self.d * r
+        discriminant = torch.clamp(discriminant, min=0.0)
+        r_idx = torch.floor((-(self.a0 - 0.5 * self.d) + torch.sqrt(discriminant)) / self.d).int()
+
+        # uniform angular & z quantization
+        theta_idx = torch.floor(((theta + np.pi) / (2 * np.pi)) * self.angular_bins).int()
+
+        z_min = z.min()
+        z_max = z.max()
+        z_range = torch.clamp(z_max - z_min, min=1e-3)
+        z_idx = torch.floor(((z - z_min) / z_range) * self.z_bins).int()
+        z_idx = torch.clamp(z_idx, max=self.z_bins - 1)  # safeguard upper boundary
+
+        # extract only unique and occupied voxels
+        voxel_indices = torch.stack([r_idx, theta_idx, z_idx], dim=1)
+        unique_voxels, counts = torch.unique(voxel_indices, dim=0, return_counts=True)
+        min_points_threshold = 50
+        valid_mask = counts >= min_points_threshold
+        unique_voxels = unique_voxels[valid_mask]
+
+        if len(unique_voxels) == 0:
+            unique_voxels = torch.unique(voxel_indices, dim=0)
+
+        print(f"DEBUG: Generated {unique_voxels.shape[0]} NUC-API anchors.") # validation
+
+        # convert voxel centers back to cartesian space
+        u_r_idx = unique_voxels[:, 0].float()
+        u_theta_idx = unique_voxels[:, 1].float()
+        u_z_idx = unique_voxels[:, 2].float()
+
+        # get geometric centers
+        r_min_bound = u_r_idx * self.a0 + 0.5 * self.d * u_r_idx * (u_r_idx - 1)
+        r_max_bound = (u_r_idx + 1) * self.a0 + 0.5 * self.d * (u_r_idx + 1) * u_r_idx
+        r_center = (r_min_bound + r_max_bound) / 2.0
+
+        theta_center = (u_theta_idx + 0.5) * (2 * np.pi / self.angular_bins) - np.pi
+        z_center = (u_z_idx + 0.5) * (z_range / self.z_bins) + z_min
+
+        center_x = r_center * torch.cos(theta_center)
+        center_y = r_center * torch.sin(theta_center)
+        voxel_centers = torch.stack([center_x, center_y, z_center], dim=1)  # [V, 3]
+
+        # get anchors
+        dists_to_centers = torch.cdist(voxel_centers, full_coord)
+        anchor_indices = torch.argmin(dists_to_centers, dim=1)
+        anchors = full_coord[anchor_indices]
+
+        # get kNN Spheres around the anchors
         dists_to_anchors = torch.cdist(anchors, full_coord)
         _, knn_indices = torch.topk(dists_to_anchors, k=self.chunk_size, largest=False, dim=1)
 
@@ -264,6 +422,8 @@ class AverageLogitMerger(PredictionMerger):
         # Adds the raw logits to the global accumulator based on the provided indices
         self.full_logits[indices] += chunk_logits
         self.full_count[indices] += 1.0
+        self.prediction_counts[indices] += 1
+
 
     def get_final_predictions(self) -> torch.Tensor:
         # prevent division by zero
@@ -295,6 +455,8 @@ class HardUncertaintyMerger(PredictionMerger):
         expected_probs = kwargs['expected_probs']
         entropy = kwargs['uncertainty']
 
+        self.prediction_counts[indices] += 1
+
         # identify which points in the incoming chunk have better (lower) entropy
         current_best_entropy = self.best_entropy[indices]
         update_mask = entropy < current_best_entropy
@@ -323,6 +485,8 @@ class SoftUncertaintyMerger(PredictionMerger):
         expected_probs = kwargs['expected_probs']
         entropy = kwargs['uncertainty']
 
+        self.prediction_counts[indices] += 1
+
         # calculate inverse uncertainty weights
         weights = 1.0 / (entropy + self.eps)
         weights = weights.unsqueeze(1)  # [N, 1]
@@ -344,17 +508,26 @@ def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
     strategy = strategy.lower()
     if strategy == 'block':
         block_size_m = kwargs.get('block_size_m', 8.0)
-        overlap_m = kwargs.get('overlap_m', 1.5)
+        overlap_m = kwargs.get('overlap_m', 0.5)
         return SlidingBlockSampler(chunk_size, block_size_m, overlap_m)
     elif strategy == 'hilbert':
-        overlap_points = kwargs.get('overlap_size', 2000)
+        overlap_points = kwargs.get('overlap_size', 5000)
         return HilbertSampler(chunk_size, overlap_points)
     elif strategy == 'fps_knn':
-        oversample_factor = kwargs.get('oversample_factor', 1.5)
+        oversample_factor = kwargs.get('oversample_factor', 4.0)
         return FPSKNNSampler(chunk_size, oversample_factor)
     elif strategy == 'voxel_knn':
         voxel_size = kwargs.get('voxel_size', 6.0)
         return VoxelKNNSampler(chunk_size, voxel_size)
+    elif strategy == 'kdtree_knn':
+        leaf_size = kwargs.get('leaf_size', 4000)
+        return KDTreeKNNSampler(chunk_size, leaf_size=leaf_size)
+    elif strategy == 'nuc_knn':
+        a0 = kwargs.get('a0', 2.0)
+        d = kwargs.get('d', 1.0)
+        angular_bins = kwargs.get('angular_bins', 6)
+        z_bins = kwargs.get('z_bins', 1)
+        return NUCVoxelKNNSampler(chunk_size, a0, d, angular_bins, z_bins)
     else:
         raise ValueError(f"Unknown sampling strategy: {strategy}")
 
@@ -408,9 +581,7 @@ def main(args):
 
     inference_dir = os.path.join(args.output_dir, "inference", args.inference_id)
     os.makedirs(inference_dir, exist_ok=True)
-
     chunk_size = args.chunk_size
-    stride = chunk_size - args.overlap_size
 
     print(f"> [Inference] Loading checkpoint: {args.checkpoint_path}")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
@@ -473,7 +644,14 @@ def main(args):
     )
 
     hist = np.zeros((num_classes, num_classes))
-    inference_times = []
+
+    sampling_times_ms = []
+    model_times_ms = []
+    fusion_times_ms = []
+    e2e_times_ms = []
+    oversampling_factors = []
+    total_cleanup_iterations = 0
+    interpolated_percentages_list = []
 
     print("> [System] Warming up JIT kernel. Compile Simt algos with nvrtc...")
 
@@ -507,8 +685,14 @@ def main(args):
             if m.__class__.__name__.startswith('Dropout'):
                 m.train()
 
+    use_interpolation_cleanup = args.sampling_strategy in ['block', 'hilbert', 'voxel_knn']
+    use_knn_cleanup = args.sampling_strategy in ['fps_knn', 'nuc_knn', 'kdtree_knn']
+
     with torch.no_grad():
         for i, data_dict in tqdm(enumerate(dataloader), total=len(dataloader)):
+            # aggregate node compute time (end to end)
+            t_e2e_start = time.time()
+
             full_coord = data_dict['coord'].to(device)
             full_feat = data_dict['feat'].to(device)
             full_label = data_dict['label'].to(device)
@@ -532,9 +716,18 @@ def main(args):
             )
 
             torch.cuda.synchronize()
-            t_start = time.time()
+            t_sample_start = time.time() # measure time for sampling
 
-            for chunk_idx in sampler.generate_chunks(full_coord):
+            chunks = list(sampler.generate_chunks(full_coord))
+
+            torch.cuda.synchronize()
+            frame_sample_ms = (time.time() - t_sample_start) * 1000.0
+
+            # async event collectors
+            model_events = []
+            fusion_events = []
+
+            for chunk_idx in chunks:
                 chunk_coord = full_coord[chunk_idx]
                 chunk_feat = full_feat[chunk_idx]
                 chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
@@ -546,14 +739,20 @@ def main(args):
                     "grid_size": 0.01
                 }
 
+                m_start, m_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                f_start, f_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
                 if use_mc_dropout:
+                    m_start.record()
                     chunk_probs_list = []
                     # run M stochastic passes
                     for _ in range(args.mc_passes):
                         output = model(chunk_input)
                         logits = seg_head(output.feat)
                         chunk_probs_list.append(torch.softmax(logits, dim=1))
-
+                    m_end.record()
+                    model_events.append((m_start, m_end))
+                    f_start.record()
                     # per-tile prediction and uncertainty calculation
                     stacked_probs = torch.stack(chunk_probs_list, dim=0)  # [M, N, C]
                     expected_probs = stacked_probs.mean(dim=0)  # [N, C]
@@ -564,13 +763,21 @@ def main(args):
 
                     fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
 
+                    f_end.record()
+                    fusion_events.append((f_start, f_end))
+
                 else:
+                    m_start.record()
                     # logit averaging baseline
                     output = model(chunk_input)
                     logits = seg_head(output.feat)
+                    m_end.record()
+                    model_events.append((m_start, m_end))
+                    f_start.record()
                     fusion.update(chunk_idx, chunk_logits=logits)
+                    f_end.record()
+                    fusion_events.append((f_start, f_end))
 
-            # iterative cleanup for kNN strategies for 100% coverage
             def get_missed_mask(fusion_merger):
                 if isinstance(fusion_merger, AverageLogitMerger):
                     return fusion_merger.full_count.squeeze(1) == 0
@@ -580,62 +787,126 @@ def main(args):
                     return fusion_merger.sum_weights.squeeze(1) == 0
                 return torch.zeros(total_points, dtype=torch.bool, device=device)
 
-            missed_mask = get_missed_mask(fusion)
+            num_interpolated = 0
             cleanup_iterations = 0
 
-            while missed_mask.any():
-                cleanup_iterations += 1
-                missed_indices = torch.nonzero(missed_mask).squeeze(1)
-
-                # pick first missed point as center of a new chunk
-                anchor_idx = missed_indices[0]
-                anchor_point = full_coord[anchor_idx].unsqueeze(0)
-
-                dists = torch.cdist(anchor_point, full_coord)
-                _, chunk_idx = torch.topk(dists, k=chunk_size, largest=False, dim=1)
-                chunk_idx = chunk_idx.squeeze(0)
-
-                chunk_coord = full_coord[chunk_idx]
-                chunk_feat = full_feat[chunk_idx]
-                chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
-
-                chunk_input = {
-                    "coord": chunk_coord,
-                    "feat": chunk_feat,
-                    "batch": chunk_batch_idx,
-                    "grid_size": 0.01
-                }
-
-                if use_mc_dropout:
-                    chunk_probs_list = []
-                    for _ in range(args.mc_passes):
-                        output = model(chunk_input)
-                        logits = seg_head(output.feat)
-                        chunk_probs_list.append(torch.softmax(logits, dim=1))
-
-                    stacked_probs = torch.stack(chunk_probs_list, dim=0)
-                    expected_probs = stacked_probs.mean(dim=0)
-                    eps = 1e-10
-                    entropy = -torch.sum(expected_probs * torch.log(expected_probs + eps), dim=1)
-
-                    fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
-                else:
-                    output = model(chunk_input)
-                    logits = seg_head(output.feat)
-                    fusion.update(chunk_idx, chunk_logits=logits)
-
-                # check which points are still missing
+            if use_knn_cleanup:
                 missed_mask = get_missed_mask(fusion)
 
-            if cleanup_iterations > 0:
-                print(
-                    f"  -> [System] Required {cleanup_iterations} knn cleanup passes to achieve 100% coverage")
+                while missed_mask.any():
+                    cleanup_iterations += 1
+                    missed_indices = torch.nonzero(missed_mask).squeeze(1)
+
+                    # pick first missed point as center of a new chunk
+                    anchor_idx = missed_indices[0]
+                    anchor_point = full_coord[anchor_idx].unsqueeze(0)
+
+                    t_cleanup_start = time.time()
+                    dists = torch.cdist(anchor_point, full_coord)
+                    _, chunk_idx = torch.topk(dists, k=chunk_size, largest=False, dim=1)
+                    chunk_idx = chunk_idx.squeeze(0)
+                    frame_sample_ms += (time.time() - t_cleanup_start) * 1000.0
+
+                    chunk_coord = full_coord[chunk_idx]
+                    chunk_feat = full_feat[chunk_idx]
+                    chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
+
+                    chunk_input = {
+                        "coord": chunk_coord,
+                        "feat": chunk_feat,
+                        "batch": chunk_batch_idx,
+                        "grid_size": 0.01
+                    }
+
+                    m_start, m_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    f_start, f_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+                    if use_mc_dropout:
+                        m_start.record()
+                        chunk_probs_list = []
+                        for _ in range(args.mc_passes):
+                            output = model(chunk_input)
+                            logits = seg_head(output.feat)
+                            chunk_probs_list.append(torch.softmax(logits, dim=1))
+                        m_end.record()
+                        model_events.append((m_start, m_end))
+
+                        f_start.record()
+                        stacked_probs = torch.stack(chunk_probs_list, dim=0)
+                        expected_probs = stacked_probs.mean(dim=0)
+                        eps = 1e-10
+                        entropy = -torch.sum(expected_probs * torch.log(expected_probs + eps), dim=1)
+
+                        fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
+                        f_end.record()
+                        fusion_events.append((f_start, f_end))
+                    else:
+                        m_start.record()
+                        output = model(chunk_input)
+                        logits = seg_head(output.feat)
+                        m_end.record()
+                        model_events.append((m_start, m_end))
+
+                        f_start.record()
+                        fusion.update(chunk_idx, chunk_logits=logits)
+                        f_end.record()
+                        fusion_events.append((f_start, f_end))
+
+                    # check which points are still missing
+                    missed_mask = get_missed_mask(fusion)
+
+                if cleanup_iterations > 0:
+                    print(
+                        f"  -> [System] Required {cleanup_iterations} knn cleanup passes to achieve 100% coverage")
+
+            total_cleanup_iterations += cleanup_iterations
 
             torch.cuda.synchronize()
-            inference_times.append(time.time() - t_start)
+            frame_model_ms = sum(s.elapsed_time(e) for s, e in model_events)
+            frame_fusion_ms = sum(s.elapsed_time(e) for s, e in fusion_events)
 
             # Fuse and evaluate
+            t_final_fusion_start = time.time()
             final_preds = fusion.get_final_predictions()
+
+
+            if use_interpolation_cleanup:
+                unpredicted_mask = get_missed_mask(fusion)
+                predicted_mask = ~unpredicted_mask
+                num_interpolated = unpredicted_mask.sum().item()
+
+                if num_interpolated > 0 and num_interpolated < total_points:
+                    print(f"  -> [Warning] Fallback Nearest-Neighbor interpolating {num_interpolated} missed points.")
+
+                    predicted_coords = full_coord[predicted_mask]
+                    unpredicted_coords = full_coord[unpredicted_mask]
+
+                    # global indices
+                    unpred_global_indices = torch.nonzero(unpredicted_mask).squeeze(1)
+                    pred_global_indices = torch.nonzero(predicted_mask).squeeze(1)
+
+                    batch_size = 2000
+
+                    for i in range(0, unpredicted_coords.shape[0], batch_size):
+                        end_idx = min(i + batch_size, unpredicted_coords.shape[0])
+                        sub_batch_unpred = unpredicted_coords[i:end_idx]
+
+                        sub_dists = torch.cdist(sub_batch_unpred, predicted_coords)
+
+                        # get local index of the closest predicted point
+                        closest_local_indices = torch.argmin(sub_dists, dim=1)
+
+                        # map local index back to global index
+                        closest_global_indices = pred_global_indices[closest_local_indices]
+
+                        nearest_labels = final_preds[closest_global_indices]
+
+                        # assign copied label back to original output tensor
+                        batch_global_unpred_indices = unpred_global_indices[i:end_idx]
+                        final_preds[batch_global_unpred_indices] = nearest_labels
+
+            interpolated_percentages_list.append((num_interpolated / total_points) * 100.0)
+
             preds_np = final_preds.cpu().numpy()
             labels_np = full_label.cpu().numpy()
 
@@ -643,6 +914,7 @@ def main(args):
             hist += fast_hist(preds_np[valid_mask], labels_np[valid_mask], num_classes)
 
             preds_kitti = kitti_map_array[preds_np]
+            frame_fusion_ms += (time.time() - t_final_fusion_start) * 1000.0
 
             original_path = data_dict['file_path'][0]
             seq_id = original_path.split('/')[-3]
@@ -651,6 +923,14 @@ def main(args):
             os.makedirs(save_dir, exist_ok=True)
 
             preds_kitti.tofile(os.path.join(save_dir, frame_name))
+
+            frame_e2e_ms = (time.time() - t_e2e_start) * 1000.0
+
+            sampling_times_ms.append(frame_sample_ms)
+            model_times_ms.append(frame_model_ms)
+            fusion_times_ms.append(frame_fusion_ms)
+            e2e_times_ms.append(frame_e2e_ms)
+            oversampling_factors.append(fusion.get_average_oversampling())
 
         # Construct JSON payload with raw counts
         node_metrics = {
@@ -667,9 +947,16 @@ def main(args):
                 "end_idx": args.end_idx
             },
             "raw_metrics": {
-                "hist": hist.tolist(),  # raw confusion matrix
-                "total_inference_time_sec": sum(inference_times),
-                "total_frames": len(inference_times)
+                "total_sampling_time_sec": sum(sampling_times_ms) / 1000.0,
+                "total_model_time_sec": sum(model_times_ms) / 1000.0,
+                "total_fusion_time_sec": sum(fusion_times_ms) / 1000.0,
+                "total_e2e_time_sec": sum(e2e_times_ms) / 1000.0,
+                "total_frames": len(e2e_times_ms),
+                "average_oversampling": sum(oversampling_factors) / len(oversampling_factors) if oversampling_factors else 1.0,
+                "average_interpolated_percentage": sum(interpolated_percentages_list) / len(
+                    interpolated_percentages_list) if interpolated_percentages_list else 0.0,
+                "cleanup_iterations": total_cleanup_iterations,
+                "hist": hist.tolist()
             }
         }
 
