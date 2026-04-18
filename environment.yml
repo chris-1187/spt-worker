@@ -18,3 +18,4 @@ dependencies:
     - plyfile
     - open3d
     - tqdm
+    - redis

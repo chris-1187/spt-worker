@@ -5,10 +5,10 @@ import time
 import torch
 import warnings
 import numpy as np
+import redis
 from abc import ABC, abstractmethod
 from typing import Iterator
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from spt_worker.dataset import KittiSemanticDataset
 from spt_worker.model import PointTransformerV3
@@ -118,7 +118,7 @@ class HilbertSampler(PointChunkSampler):
     Overlap is defined in points.
     """
 
-    def __init__(self, chunk_size: int, overlap_points: int = 5000, grid_size: float = 0.01, **kwargs):
+    def __init__(self, chunk_size: int, overlap_points: int = 2000, grid_size: float = 0.01, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.overlap_points = overlap_points
         self.stride = chunk_size - overlap_points
@@ -265,7 +265,7 @@ class KDTreeKNNSampler(PointChunkSampler):
     Divides the point cloud along its widest axis at the median point until every spatial leaf contains fewer than `leaf_size` points.
     Then extracts the geometric centroid of each leaf as a kNN anchor.
     """
-    def __init__(self, chunk_size: int, leaf_size: int = 4000, **kwargs):
+    def __init__(self, chunk_size: int, leaf_size: int = 8000, **kwargs): # 4000 = 32 chunks, 8000 = 16 chunks
         super().__init__(chunk_size, **kwargs)
         self.leaf_size = leaf_size
 
@@ -511,7 +511,7 @@ def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
         overlap_m = kwargs.get('overlap_m', 0.5)
         return SlidingBlockSampler(chunk_size, block_size_m, overlap_m)
     elif strategy == 'hilbert':
-        overlap_points = kwargs.get('overlap_size', 5000)
+        overlap_points = kwargs.get('overlap_size', 2000)
         return HilbertSampler(chunk_size, overlap_points)
     elif strategy == 'fps_knn':
         oversample_factor = kwargs.get('oversample_factor', 4.0)
@@ -520,7 +520,7 @@ def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
         voxel_size = kwargs.get('voxel_size', 6.0)
         return VoxelKNNSampler(chunk_size, voxel_size)
     elif strategy == 'kdtree_knn':
-        leaf_size = kwargs.get('leaf_size', 4000)
+        leaf_size = kwargs.get('leaf_size', 8000)
         return KDTreeKNNSampler(chunk_size, leaf_size=leaf_size)
     elif strategy == 'nuc_knn':
         a0 = kwargs.get('a0', 2.0)
@@ -568,12 +568,6 @@ def fast_hist(pred, label, n):
     k = (label >= 0) & (label < n)
     return np.bincount(n * label[k].astype(int) + pred[k], minlength=n ** 2).reshape(n, n)
 
-def per_class_iu(hist):
-    return np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
-
-def per_class_acc(hist):
-    return np.diag(hist) / hist.sum(1)
-
 
 def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -582,6 +576,15 @@ def main(args):
     inference_dir = os.path.join(args.output_dir, "inference", args.inference_id)
     os.makedirs(inference_dir, exist_ok=True)
     chunk_size = args.chunk_size
+
+    # Redis connection
+    print(f"> [Inference] Connecting to Redis Queue at {args.redis_host}...")
+    try:
+        redis_client = redis.Redis(host=args.redis_host, port=6379, db=0)
+        redis_client.ping()
+    except redis.ConnectionError:
+        print("[ERROR] Could not connect to Redis server. Exiting.")
+        return
 
     print(f"> [Inference] Loading checkpoint: {args.checkpoint_path}")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
@@ -630,18 +633,11 @@ def main(args):
         training=False,
         max_points=None,
         sampling_strategy=args.sampling_strategy,
-        start_idx = args.start_idx,
-        end_idx = args.end_idx
     )
 
-    dataloader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
+    if len(val_dataset) == 0:
+        print("[ERROR] No files found in dataset.")
+        return
 
     hist = np.zeros((num_classes, num_classes))
 
@@ -655,19 +651,14 @@ def main(args):
 
     print("> [System] Warming up JIT kernel. Compile Simt algos with nvrtc...")
 
-    warmup_loader = DataLoader(
-        val_dataset, batch_size=1, num_workers=args.num_workers,
-        collate_fn=collate_fn, shuffle=False
-    )
-    warmup_batch = next(iter(warmup_loader))
-
+    warmup_batch = collate_fn([val_dataset[0]])
     warmup_batch['grid_size'] = 0.01
     for key, value in warmup_batch.items():
         if isinstance(value, torch.Tensor):
             warmup_batch[key] = value.to(device, non_blocking=True)
 
     with torch.no_grad():
-            model(warmup_batch)
+        model(warmup_batch)
 
     print("> [System] Algos compiled. Starting inference evaluation...")
 
@@ -688,8 +679,27 @@ def main(args):
     use_interpolation_cleanup = args.sampling_strategy in ['block', 'hilbert', 'voxel_knn']
     use_knn_cleanup = args.sampling_strategy in ['fps_knn', 'nuc_knn', 'kdtree_knn']
 
+    frames_processed = 0
+
     with torch.no_grad():
-        for i, data_dict in tqdm(enumerate(dataloader), total=len(dataloader)):
+        while True:
+            # atomic popping from redis queue
+            raw_idx = redis_client.lpop(args.redis_queue)
+
+            if raw_idx is None:
+                # queue is empty -> break the loop
+                print(f"\n> [Worker {args.node_name}] Queue empty. Spinning down.")
+                break
+
+            dataset_idx = int(raw_idx)
+
+            if frames_processed % 10 == 0:
+                print(f"  -> [Worker {args.node_name}] Fetched and processing frame index {dataset_idx}...")
+
+            # fetch one frame and collate
+            data_dict_raw = val_dataset[dataset_idx]
+            data_dict = collate_fn([data_dict_raw])
+
             # aggregate node compute time (end to end)
             t_e2e_start = time.time()
 
@@ -703,7 +713,6 @@ def main(args):
             sampler = get_sampler(
                 args.sampling_strategy,
                 chunk_size,
-                overlap_size=args.overlap_size
             )
 
             # initialize fusion
@@ -932,6 +941,8 @@ def main(args):
             e2e_times_ms.append(frame_e2e_ms)
             oversampling_factors.append(fusion.get_average_oversampling())
 
+            frames_processed += 1
+
         # Construct JSON payload with raw counts
         node_metrics = {
             "node_name": args.node_name,
@@ -943,8 +954,7 @@ def main(args):
                 "fusion_method": args.fusion_method,
                 "mc_passes": args.mc_passes,
                 "sequences": args.sequences,
-                "start_idx": args.start_idx,
-                "end_idx": args.end_idx
+                "redis_queue_name": args.redis_queue
             },
             "raw_metrics": {
                 "total_sampling_time_sec": sum(sampling_times_ms) / 1000.0,
@@ -983,8 +993,8 @@ if __name__ == "__main__":
     parser.add_argument('--fusion_strategy', type=str, default='mc_uncertainty', choices=['logit_average', 'mc_uncertainty'])
     parser.add_argument('--fusion_method', type=str, default='soft', choices=['soft', 'hard'])
     parser.add_argument('--mc_passes', type=int, default=10)
-    parser.add_argument('--start_idx', type=int, default=None, help="Start frame index for this worker")
-    parser.add_argument('--end_idx', type=int, default=None, help="End frame index for this worker")
+    parser.add_argument('--redis_host', type=str, required=True, help="IP of the primary node hosting the redis queue")
+    parser.add_argument('--redis_queue', type=str, required=True, help="Key of the redis list")
     parser.add_argument('--node_name', type=str, required=True, help="Name of the worker node")
     args = parser.parse_args()
     main(args)

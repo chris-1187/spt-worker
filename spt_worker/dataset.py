@@ -2,7 +2,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import socket
 from .serialization import hilbert as hilbert_curve
 
 IGNORE_INDEX = -1
@@ -54,9 +53,7 @@ class KittiSemanticDataset(Dataset):
                  sequences: list[str] = None,
                  training: bool = None,
                  max_points: int = 10240,
-                 sampling_strategy: str = 'hilbert',
-                 start_idx: int = None,
-                 end_idx: int = None):
+                 sampling_strategy: str = 'hilbert'):
         """
         Args:
             root_dir (str): The root directory of the dataset, e.g., '.../kitti/dataset'.
@@ -70,22 +67,7 @@ class KittiSemanticDataset(Dataset):
         self.sampling_strategy = sampling_strategy.lower()
 
         if self.sampling_strategy not in ['block', 'hilbert', 'fps_knn', 'voxel_knn', 'nuc_knn', 'kdtree_knn']:
-            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'block', 'hilbert', 'fps_knn' or 'voxel_knn'.")
-
-        """
-        # Static load balancing
-        hostname = socket.gethostname()
-        if max_points is None:
-            self.max_points = None
-            print(f"> [Dataset] Max Points: Unlimited (Validation/Full Frame Mode)")
-        # Adjust for the weaker node (Host 3)
-        elif "host3" in hostname:
-            print(f"> [Optimization] Detected Straggler Node ({hostname}). Reducing max_points to 10000.")
-            self.max_points = 10000  # Cap at 10k for the 1050 Ti
-        else:
-            print(f"> [Optimization] High-Performance Node ({hostname}). Keeping max_points at {max_points}.")
-            self.max_points = max_points
-        """
+            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}. Use 'block', 'hilbert', 'fps_knn', 'nuc_knn', 'kdtree_knn' or 'voxel_knn'.")
 
         self.max_points = max_points
         self.point_files = []
@@ -109,13 +91,6 @@ class KittiSemanticDataset(Dataset):
             self.point_files.sort()
             if self.labels_dir:
                 self.label_files.sort()
-
-            if start_idx is not None and end_idx is not None:
-                self.point_files = self.point_files[start_idx:end_idx]
-                if self.labels_dir:
-                    self.label_files = self.label_files[start_idx:end_idx]
-                print(
-                    f"> [Distributed Inference] Worker assigned {len(self.point_files)} frames (Indices {start_idx} to {end_idx - 1})")
 
         if self.labels_dir:
             assert len(self.point_files) > 0, "No point cloud files found."
@@ -242,7 +217,7 @@ class KittiSemanticDataset(Dataset):
                     if labels is not None:
                         semantic_labels = semantic_labels[start_idx:end_idx]
 
-            elif self.sampling_strategy in ['knn', 'fps_knn', 'voxel_knn']:
+            elif self.sampling_strategy == 'knn':
                 knn_idx = self._get_knn_indices(points[:, :3], k=self.max_points)
                 points = points[knn_idx]
                 original_indices = original_indices[knn_idx]
