@@ -26,16 +26,12 @@ def setup_distributed():
     """Initializes the distributed process group."""
     if is_distributed():
         dist.init_process_group("nccl")
-
         local_rank = int(os.environ["LOCAL_RANK"])
-
         global_rank = dist.get_rank()
-
         torch.cuda.set_device(local_rank)
-
         return torch.device(f"cuda:{local_rank}"), global_rank, dist.get_world_size()
     else:
-        # Single-machine setup
+        # single node setup
         if torch.cuda.is_available():
             return torch.device("cuda:0"), 0, 1
         elif torch.backends.mps.is_available():
@@ -51,7 +47,7 @@ def cleanup():
 
 
 def collate_fn(batch):
-    """Custom collate function to handle variable-size point clouds."""
+    """Custom collate function to handle variable size point clouds."""
     collated = {}
     batch_indices = []
 
@@ -70,10 +66,10 @@ def collate_fn(batch):
     for key in collated:
         if isinstance(collated[key][0], torch.Tensor):
             collated[key] = torch.cat(collated[key], dim=0)
-
     collated['batch'] = torch.cat(batch_indices, dim=0)
 
     return collated
+
 
 def main(args):
     """The main training function, adaptable for single or distributed runs."""
@@ -82,9 +78,7 @@ def main(args):
     device, rank, world_size = setup_distributed()
     print(f"> [DEBUG] Global Rank: {rank} | Local Device: {device} | World Size: {world_size}")
 
-    # ------------------------------------------------------------------
-    # MODEL CONFIG
-    # ------------------------------------------------------------------
+    # MODEL CONFIGURATION
     model_config = {
         "in_channels": 4,
         "enable_flash": False,
@@ -176,18 +170,19 @@ def main(args):
     out_channels = 32
     seg_head = torch.nn.Linear(out_channels, num_classes).to(device)
 
+    # Setup DDP
     if is_distributed():
         model = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None)
         seg_head = DDP(seg_head, device_ids=[device.index] if device.type == 'cuda' else None)
 
+    # Init AdamW optimizer
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(seg_head.parameters()),
         lr=args.learning_rate,
         weight_decay=0.01  # Standard regularization for AdamW
     )
 
-    # learning rate schedule (Warmup + Cosine Decay)
-
+    # learning rate schedule (warmup + cosine decay)
     total_steps_per_epoch = len(dataloader) // args.accumulation_steps
 
     # warmup phase: first 5% of training
@@ -201,7 +196,7 @@ def main(args):
         total_iters=warmup_steps
     )
 
-    # cosine decay phase
+    # cosine decay phase: rest 95% of training
     decay_epochs = args.epochs - warmup_epochs
     decay_steps = decay_epochs * total_steps_per_epoch
 
@@ -211,6 +206,7 @@ def main(args):
         eta_min=1e-6
     )
 
+    # final scheduler
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
@@ -277,6 +273,7 @@ def main(args):
 
             # Forward Pass
             output = model(data_dict)
+
             logits = seg_head(output.feat)
             labels = data_dict["label"]
             loss = criterion(logits, labels)
@@ -285,7 +282,7 @@ def main(args):
                 print(f"> [Warning] NaN loss on Rank {rank} at batch {i}. Injecting connected zero-loss.")
                 loss = (logits * 0.0).sum()
 
-            # Tack loss of current batch to average later
+            # Track loss of current batch to average later
             epoch_loss_sum += loss.item()
             num_batches += 1
 
@@ -329,13 +326,17 @@ def main(args):
             current_lr = scheduler.get_last_lr()[0]  # Log the new LR
             print(f"> [Info] Epoch {epoch + 1} LR: {current_lr:.6f}")
 
+            total_frames_epoch = len(full_dataset)
+            throughput_fps = total_frames_epoch / epoch_duration if epoch_duration > 0 else 0.0
+
             stats = {
                 "epoch": epoch + 1,
                 "timestamp": datetime.now().isoformat(),
                 "epoch_duration_sec": round(epoch_duration, 2),
+                "epoch_duration_min": round(epoch_duration / 60, 2),
+                "throughput_fps": round(throughput_fps, 2),
                 "learning_rate": current_lr,
-                "train_loss": avg_train_loss,
-                # val_mIoU: after validation loop
+                "train_loss": avg_train_loss
             }
 
             with open(os.path.join(log_dir, "metrics.jsonl"), "a") as f:
@@ -405,9 +406,9 @@ if __name__ == "__main__":
 
     # Data and Model Paths
     parser.add_argument('--data_path', type=str, required=True, help="Root path to the datasets point clouds.")
-    parser.add_argument('--labels_path', type=str, required=True, help="Root path to the dataset's labels.")
+    parser.add_argument('--labels_path', type=str, required=True, help="Root path to the datasets labels.")
     parser.add_argument('--sequences', type=str, nargs='+', default=None,
-                        help="List of sequence IDs to use (e.g., --sequences 00 01 02). If not set, all are used.")
+                        help="List of sequence IDs to use (e.g. --sequences 00 01 02). If not set, all are used.")
 
     # Training Hyperparameters
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs.")
@@ -422,7 +423,7 @@ if __name__ == "__main__":
                         help="Path to checkpoint .pt file to resume training from.")
     parser.add_argument('--sampling_strategy', type=str, default='block',
                         choices=['block', 'hilbert', 'fps_knn', 'voxel_knn'],
-                        help="Strategy to sample point chunks: 'block', 'hilbert', 'fps_knn', 'voxel_knn'.")
+                        help="Strategy to sample point chunks: 'block', 'hilbert', 'fps_knn', 'voxel_knn', 'nuc_knn', 'kdtree_knn'.")
 
     args = parser.parse_args()
 

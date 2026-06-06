@@ -62,10 +62,8 @@ class PredictionMerger(ABC):
 
 class SlidingBlockSampler(PointChunkSampler):
     """
-    Equal Grid Slicing Strategy (Baseline).
-    Slides a fixed-size spatial block over the point cloud (ignoring z-axis).
-    If a block exceeds the chunk limit, points are randomly dropped to fit.
-    Empty blocks are ignored.
+    Planar sliding window partitioning (Baseline): Slides a fixed-size spatial block over the point cloud (ignoring z-axis).
+    If a block exceeds the chunk limit, points are randomly dropped to fit. Empty blocks are ignored.
     """
 
     def __init__(self, chunk_size: int, block_size_m: float = 8.0, overlap_m: float = 0.5, **kwargs):
@@ -113,12 +111,11 @@ class SlidingBlockSampler(PointChunkSampler):
 
 class HilbertSampler(PointChunkSampler):
     """
-    1D Sliding Window Strategy: Sorts the raw 3D points into a 1D sequence
-    using a hilbert curve, then slides a window across this sequence.
-    Overlap is defined in points.
+    Sequential patching via hilbert curve serialization: Sorts the raw 3D points into a 1D sequence using a hilbert
+    curve, then slides a window across this sequence. Overlap is defined in points.
     """
 
-    def __init__(self, chunk_size: int, overlap_points: int = 2000, grid_size: float = 0.01, **kwargs):
+    def __init__(self, chunk_size: int, overlap_points: int = 5000, grid_size: float = 0.01, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.overlap_points = overlap_points
         self.stride = chunk_size - overlap_points
@@ -152,13 +149,11 @@ class HilbertSampler(PointChunkSampler):
 
 class FPSKNNSampler(PointChunkSampler):
     """
-    Farthest Point Sampling + kNN Strategy.
-    Finds uniform anchor points across the point cloud, then extracts the k nearest
-    neighbors around each anchor.
-    Overlap is defined indirectly by an oversampling factor.
+    Uniform anchoring via farthest point sampling (FPS): Finds uniform anchor points across the point cloud, then
+    extracts the k nearest neighbors around each anchor. Overlap is defined indirectly by an oversampling factor.
     """
 
-    def __init__(self, chunk_size: int, oversample_factor: float = 4.0, **kwargs):
+    def __init__(self, chunk_size: int, oversample_factor: float = 6.0, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.oversample_factor = oversample_factor
 
@@ -210,13 +205,12 @@ class FPSKNNSampler(PointChunkSampler):
 
 class VoxelKNNSampler(PointChunkSampler):
     """
-    Voxel-guided + kNN Strategy.
-    Finds uniform anchor points through voxelization. Uses sparse voxelization to get occupied regions.
-    Uses the point closest to each occupied voxel's center as the anchor. Then extracts k nearest neighbors around each anchor.
-    Overlap is defined indirectly by the voxel size.
+    Sparse voxel-guided anchoring: Finds uniform anchor points through voxelization. Uses sparse voxelization to get
+    occupied regions. Uses the point closest to each occupied voxel's center as the anchor and extracts k nearest
+    neighbors around each. Overlap is defined indirectly by the voxel size.
     """
 
-    def __init__(self, chunk_size: int, voxel_size: float = 6.0, **kwargs):
+    def __init__(self, chunk_size: int, voxel_size: float = 8.0, **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.voxel_size = voxel_size
 
@@ -227,7 +221,7 @@ class VoxelKNNSampler(PointChunkSampler):
             yield torch.arange(total_points, device=full_coord.device)
             return
 
-        # Sparse Voxelization (O(N)), shift coords to positive space for stable floor division
+        # sparse voxelization: shift coords to positive space for stable floor division
         min_coord = full_coord.min(dim=0)[0]
         shifted_coord = full_coord - min_coord
 
@@ -261,11 +255,10 @@ class VoxelKNNSampler(PointChunkSampler):
 
 class KDTreeKNNSampler(PointChunkSampler):
     """
-    Recursive KD-Tree spatial partitioning.
-    Divides the point cloud along its widest axis at the median point until every spatial leaf contains fewer than `leaf_size` points.
-    Then extracts the geometric centroid of each leaf as a kNN anchor.
+    Recursive kd-tree partitioning: Divides the point cloud along its widest axis at the median point until every
+    spatial leaf contains fewer than `leaf_size` points. Then extracts the geometric centroid of each leaf as kNN anchor.
     """
-    def __init__(self, chunk_size: int, leaf_size: int = 8000, **kwargs): # 4000 = 32 chunks, 8000 = 16 chunks
+    def __init__(self, chunk_size: int, leaf_size: int = 4000, **kwargs): # 4000 = 32 chunks, 8000 = 16 chunks
         super().__init__(chunk_size, **kwargs)
         self.leaf_size = leaf_size
 
@@ -276,7 +269,7 @@ class KDTreeKNNSampler(PointChunkSampler):
         if num_points <= self.leaf_size:
             return [coords.mean(dim=0)]
 
-        # find the dimension with the largest physical spatial extent
+        # find the dimension with the largest physical extent
         mins = coords.min(dim=0)[0]
         maxs = coords.max(dim=0)[0]
         extents = maxs - mins
@@ -323,11 +316,11 @@ class KDTreeKNNSampler(PointChunkSampler):
 
 class NUCVoxelKNNSampler(PointChunkSampler):
     """
-    Non-uniform cylindrical approach using Arithmetic Progression of Interval (API) Strategy.
-    Dynamically expands voxel boundaries radially to adjust to non-unform LiDAR point distribution.
+    Non-uniform anchoring via cylindrical partitioning: Dynamically expands voxel boundaries radially using Arithmetic
+    Progression of Interval (API) Strategy, to adjust to non-unform LiDAR point distribution.
     """
 
-    def __init__(self, chunk_size: int, a0: float = 2.0, d: float = 1.0, angular_bins: int = 6, z_bins: int = 1,
+    def __init__(self, chunk_size: int, a0: float = 2.0, d: float = 1.0, angular_bins: int = 8, z_bins: int = 1,
                  **kwargs):
         super().__init__(chunk_size, **kwargs)
         self.a0 = a0  # initial voxel width at sensor
@@ -373,7 +366,7 @@ class NUCVoxelKNNSampler(PointChunkSampler):
         if len(unique_voxels) == 0:
             unique_voxels = torch.unique(voxel_indices, dim=0)
 
-        print(f"DEBUG: Generated {unique_voxels.shape[0]} NUC-API anchors.") # validation
+        # print(f"DEBUG: Generated {unique_voxels.shape[0]} NUC-API anchors.") # validation
 
         # convert voxel centers back to cartesian space
         u_r_idx = unique_voxels[:, 0].float()
@@ -409,7 +402,7 @@ class NUCVoxelKNNSampler(PointChunkSampler):
 
 class AverageLogitMerger(PredictionMerger):
     """
-    Standard Average Logit Pooling over overlapping predictions.
+    Average logit pooling (Baseline): Tracks and averages the raw logits across all tiles.
     """
 
     def __init__(self, total_points: int, num_classes: int, device: torch.device):
@@ -441,10 +434,10 @@ class AverageLogitMerger(PredictionMerger):
         return final_preds
 
 
-class HardUncertaintyMerger(PredictionMerger):
+class UncertaintyMerger(PredictionMerger):
     """
-    Hard Uncertainty Selection
-    Retains the prediction from the tile that exhibits the lowest predictive entropy.
+    Stochastic inference via Monte Carlo dropout: Keeps the prediction from the tile that exhibits the lowest
+    predictive entropy.
     """
     def __init__(self, total_points: int, num_classes: int, device: torch.device):
         super().__init__(total_points, num_classes, device)
@@ -470,38 +463,6 @@ class HardUncertaintyMerger(PredictionMerger):
         return self.best_probs.argmax(dim=1)
 
 
-class SoftUncertaintyMerger(PredictionMerger):
-    """
-    Inverse Uncertainty Weighting (Soft Selection)
-    Fuses probabilities using weights inversely proportional to predictive entropy.
-    """
-    def __init__(self, total_points: int, num_classes: int, device: torch.device):
-        super().__init__(total_points, num_classes, device)
-        self.weighted_probs = torch.zeros((total_points, num_classes), device=device)
-        self.sum_weights = torch.zeros((total_points, 1), device=device)
-        self.eps = 1e-8  # preventing division by zero for highly confident predictions
-
-    def update(self, indices: torch.Tensor, **kwargs):
-        expected_probs = kwargs['expected_probs']
-        entropy = kwargs['uncertainty']
-
-        self.prediction_counts[indices] += 1
-
-        # calculate inverse uncertainty weights
-        weights = 1.0 / (entropy + self.eps)
-        weights = weights.unsqueeze(1)  # [N, 1]
-
-        self.weighted_probs[indices] += expected_probs * weights
-        self.sum_weights[indices] += weights
-
-    def get_final_predictions(self) -> torch.Tensor:
-        valid_mask = self.sum_weights.squeeze(1) > 0
-        final_probs = torch.zeros_like(self.weighted_probs)
-        final_probs[valid_mask] = self.weighted_probs[valid_mask] / self.sum_weights[valid_mask]
-
-        return final_probs.argmax(dim=1)
-
-
 ### Strategy getter
 
 def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
@@ -511,37 +472,32 @@ def get_sampler(strategy: str, chunk_size: int, **kwargs) -> PointChunkSampler:
         overlap_m = kwargs.get('overlap_m', 0.5)
         return SlidingBlockSampler(chunk_size, block_size_m, overlap_m)
     elif strategy == 'hilbert':
-        overlap_points = kwargs.get('overlap_size', 2000)
+        overlap_points = kwargs.get('overlap_size', 5000)
         return HilbertSampler(chunk_size, overlap_points)
     elif strategy == 'fps_knn':
-        oversample_factor = kwargs.get('oversample_factor', 4.0)
+        oversample_factor = kwargs.get('oversample_factor', 6.0)
         return FPSKNNSampler(chunk_size, oversample_factor)
     elif strategy == 'voxel_knn':
-        voxel_size = kwargs.get('voxel_size', 6.0)
+        voxel_size = kwargs.get('voxel_size', 8.0)
         return VoxelKNNSampler(chunk_size, voxel_size)
     elif strategy == 'kdtree_knn':
-        leaf_size = kwargs.get('leaf_size', 8000)
+        leaf_size = kwargs.get('leaf_size', 4000)
         return KDTreeKNNSampler(chunk_size, leaf_size=leaf_size)
     elif strategy == 'nuc_knn':
         a0 = kwargs.get('a0', 2.0)
         d = kwargs.get('d', 1.0)
-        angular_bins = kwargs.get('angular_bins', 6)
+        angular_bins = kwargs.get('angular_bins', 8)
         z_bins = kwargs.get('z_bins', 1)
         return NUCVoxelKNNSampler(chunk_size, a0, d, angular_bins, z_bins)
     else:
         raise ValueError(f"Unknown sampling strategy: {strategy}")
 
-def get_merger(strategy: str, method: str, total_points: int, num_classes: int, device: torch.device) -> PredictionMerger:
+def get_merger(strategy: str, total_points: int, num_classes: int, device: torch.device) -> PredictionMerger:
     strategy = strategy.lower()
     if strategy == 'logit_average':
         return AverageLogitMerger(total_points, num_classes, device)
     elif strategy == 'mc_uncertainty':
-        if method.lower() == 'hard':
-            return HardUncertaintyMerger(total_points, num_classes, device)
-        elif method.lower() == 'soft':
-            return SoftUncertaintyMerger(total_points, num_classes, device)
-        else:
-            raise ValueError(f"Unknown MC uncertainty method: {method}. Use 'hard' or 'soft'.")
+        return UncertaintyMerger(total_points, num_classes, device)
     else:
         raise ValueError(f"Unknown fusion strategy: {strategy}")
 
@@ -594,7 +550,7 @@ def main(args):
         print("> [Inference] Found configuration in checkpoint. Loading dynamic architecture...")
         model_config = checkpoint['config']['model_architecture']
     else:
-        print("! [WARNING] No config found in checkpoint. Using HARDCODED defaults.")
+        print("! [WARNING] No config found in checkpoint. Using hardcoded defaults.")
         # Fallback
         model_config = {
             "in_channels": 4,
@@ -641,11 +597,13 @@ def main(args):
 
     hist = np.zeros((num_classes, num_classes))
 
+    # Init metrics
     sampling_times_ms = []
     model_times_ms = []
     fusion_times_ms = []
     e2e_times_ms = []
     oversampling_factors = []
+    tiles_per_frame = []
     total_cleanup_iterations = 0
     interpolated_percentages_list = []
 
@@ -671,13 +629,12 @@ def main(args):
     use_mc_dropout = args.fusion_strategy == 'mc_uncertainty'
     if use_mc_dropout:
         print(f"> [MC Dropout] Enabled with {args.mc_passes} stochastic forward passes per chunk.")
-        # Set Dropout layers into train() mode to enable stochastic sampling, while leaving BatchNorm/LayerNorm in eval() mode
+        # Set dropout layers into train() mode to enable stochastic sampling, while leaving BatchNorm/LayerNorm in eval() mode
         for m in model.modules():
             if m.__class__.__name__.startswith('Dropout'):
                 m.train()
 
-    use_interpolation_cleanup = args.sampling_strategy in ['block', 'hilbert', 'voxel_knn']
-    use_knn_cleanup = args.sampling_strategy in ['fps_knn', 'nuc_knn', 'kdtree_knn']
+    use_interpolation_cleanup = args.sampling_strategy in ['block', 'hilbert', 'voxel_knn', 'nuc_knn', 'kdtree_knn', 'fps_knn']
 
     frames_processed = 0
 
@@ -690,6 +647,8 @@ def main(args):
                 # queue is empty -> break the loop
                 print(f"\n> [Worker {args.node_name}] Queue empty. Spinning down.")
                 break
+
+            redis_client.expire(args.redis_queue, 86400)
 
             dataset_idx = int(raw_idx)
 
@@ -718,7 +677,6 @@ def main(args):
             # initialize fusion
             fusion = get_merger(
                 args.fusion_strategy,
-                args.fusion_method,
                 total_points,
                 num_classes,
                 device
@@ -728,6 +686,7 @@ def main(args):
             t_sample_start = time.time() # measure time for sampling
 
             chunks = list(sampler.generate_chunks(full_coord))
+            num_tiles = len(chunks)
 
             torch.cuda.synchronize()
             frame_sample_ms = (time.time() - t_sample_start) * 1000.0
@@ -790,85 +749,11 @@ def main(args):
             def get_missed_mask(fusion_merger):
                 if isinstance(fusion_merger, AverageLogitMerger):
                     return fusion_merger.full_count.squeeze(1) == 0
-                elif isinstance(fusion_merger, HardUncertaintyMerger):
+                elif isinstance(fusion_merger, UncertaintyMerger):
                     return fusion_merger.best_entropy == float('inf')
-                elif isinstance(fusion_merger, SoftUncertaintyMerger):
-                    return fusion_merger.sum_weights.squeeze(1) == 0
                 return torch.zeros(total_points, dtype=torch.bool, device=device)
 
             num_interpolated = 0
-            cleanup_iterations = 0
-
-            if use_knn_cleanup:
-                missed_mask = get_missed_mask(fusion)
-
-                while missed_mask.any():
-                    cleanup_iterations += 1
-                    missed_indices = torch.nonzero(missed_mask).squeeze(1)
-
-                    # pick first missed point as center of a new chunk
-                    anchor_idx = missed_indices[0]
-                    anchor_point = full_coord[anchor_idx].unsqueeze(0)
-
-                    t_cleanup_start = time.time()
-                    dists = torch.cdist(anchor_point, full_coord)
-                    _, chunk_idx = torch.topk(dists, k=chunk_size, largest=False, dim=1)
-                    chunk_idx = chunk_idx.squeeze(0)
-                    frame_sample_ms += (time.time() - t_cleanup_start) * 1000.0
-
-                    chunk_coord = full_coord[chunk_idx]
-                    chunk_feat = full_feat[chunk_idx]
-                    chunk_batch_idx = torch.zeros(chunk_coord.shape[0], dtype=torch.long, device=device)
-
-                    chunk_input = {
-                        "coord": chunk_coord,
-                        "feat": chunk_feat,
-                        "batch": chunk_batch_idx,
-                        "grid_size": 0.01
-                    }
-
-                    m_start, m_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                    f_start, f_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-
-                    if use_mc_dropout:
-                        m_start.record()
-                        chunk_probs_list = []
-                        for _ in range(args.mc_passes):
-                            output = model(chunk_input)
-                            logits = seg_head(output.feat)
-                            chunk_probs_list.append(torch.softmax(logits, dim=1))
-                        m_end.record()
-                        model_events.append((m_start, m_end))
-
-                        f_start.record()
-                        stacked_probs = torch.stack(chunk_probs_list, dim=0)
-                        expected_probs = stacked_probs.mean(dim=0)
-                        eps = 1e-10
-                        entropy = -torch.sum(expected_probs * torch.log(expected_probs + eps), dim=1)
-
-                        fusion.update(chunk_idx, expected_probs=expected_probs, uncertainty=entropy)
-                        f_end.record()
-                        fusion_events.append((f_start, f_end))
-                    else:
-                        m_start.record()
-                        output = model(chunk_input)
-                        logits = seg_head(output.feat)
-                        m_end.record()
-                        model_events.append((m_start, m_end))
-
-                        f_start.record()
-                        fusion.update(chunk_idx, chunk_logits=logits)
-                        f_end.record()
-                        fusion_events.append((f_start, f_end))
-
-                    # check which points are still missing
-                    missed_mask = get_missed_mask(fusion)
-
-                if cleanup_iterations > 0:
-                    print(
-                        f"  -> [System] Required {cleanup_iterations} knn cleanup passes to achieve 100% coverage")
-
-            total_cleanup_iterations += cleanup_iterations
 
             torch.cuda.synchronize()
             frame_model_ms = sum(s.elapsed_time(e) for s, e in model_events)
@@ -940,6 +825,7 @@ def main(args):
             fusion_times_ms.append(frame_fusion_ms)
             e2e_times_ms.append(frame_e2e_ms)
             oversampling_factors.append(fusion.get_average_oversampling())
+            tiles_per_frame.append(num_tiles)
 
             frames_processed += 1
 
@@ -966,6 +852,7 @@ def main(args):
                 "average_interpolated_percentage": sum(interpolated_percentages_list) / len(
                     interpolated_percentages_list) if interpolated_percentages_list else 0.0,
                 "cleanup_iterations": total_cleanup_iterations,
+                "total_tiles": sum(tiles_per_frame),
                 "hist": hist.tolist()
             }
         }
@@ -990,8 +877,7 @@ if __name__ == "__main__":
     parser.add_argument('--chunk_size', type=int, default=40000)
     parser.add_argument('--overlap_size', type=int, default=2000)
     parser.add_argument('--sampling_strategy', type=str, default='hilbert')
-    parser.add_argument('--fusion_strategy', type=str, default='mc_uncertainty', choices=['logit_average', 'mc_uncertainty'])
-    parser.add_argument('--fusion_method', type=str, default='soft', choices=['soft', 'hard'])
+    parser.add_argument('--fusion_strategy', type=str, default='logit_average', choices=['logit_average', 'mc_uncertainty'])
     parser.add_argument('--mc_passes', type=int, default=10)
     parser.add_argument('--redis_host', type=str, required=True, help="IP of the primary node hosting the redis queue")
     parser.add_argument('--redis_queue', type=str, required=True, help="Key of the redis list")
