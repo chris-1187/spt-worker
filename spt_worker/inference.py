@@ -672,6 +672,7 @@ def main(args):
             sampler = get_sampler(
                 args.sampling_strategy,
                 chunk_size,
+                overlap_size=args.overlap_size
             )
 
             # initialize fusion
@@ -837,7 +838,6 @@ def main(args):
                 "overlap_size": args.overlap_size,
                 "sampling_strategy": args.sampling_strategy,
                 "fusion_strategy": args.fusion_strategy,
-                "fusion_method": args.fusion_method,
                 "mc_passes": args.mc_passes,
                 "sequences": args.sequences,
                 "redis_queue_name": args.redis_queue
